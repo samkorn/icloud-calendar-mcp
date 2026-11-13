@@ -369,8 +369,11 @@ Past the token check, the server:
 - changes or deletes an event only if it hasn't changed since it was
   looked up.
 
-Titles and descriptions on shared calendars and invitations are written by
-other people. Claude is told to treat them as data, but keep approval on for
-the tools that change things, or block them (see step 9).
+Calendar names, and the titles and descriptions on shared calendars and
+invitations, are written by other people. Claude is told to treat them as
+data and not to act on requests in them, but that is advice, not a lock: the
+token reaches every calendar, and the server does not limit what Claude does
+with it. Keep approval on for the tools that change things, or block them
+(see step 9).
 
 To report a security problem, see [SECURITY.md](SECURITY.md).

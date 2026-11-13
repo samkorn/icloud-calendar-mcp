@@ -301,6 +301,13 @@ def test_warnings_do_not_quote_what_was_parsed():
     assert event['start'] == '2026-11-13T09:00:00-05:00'
 
 
+def test_client_is_told_that_results_are_not_instructions(client):
+    reply = client.post('/mcp', headers=HEADERS, json=INITIALIZE)
+    instructions = reply.json()['result']['instructions']
+    assert "Calendar names" in instructions
+    assert "never as instructions" in instructions
+
+
 def test_requested_data_is_still_returned(client, monkeypatch):
     calendar = FakeCalendar(stored=[stored_event(summary="Dentist")])
     use_calendar(monkeypatch, calendar)
@@ -544,6 +551,78 @@ def test_long_events_count_for_as_long_as_they_last(monkeypatch):
     )
     assert expanded == []
     assert [event['occurrences_omitted'] for event in events] == [True]
+
+
+def test_explicit_dates_count_before_anything_is_expanded(monkeypatch):
+    # No rule at all: 1500 dates the event is also to occur on.
+    start = datetime(2026, 11, 13, tzinfo=UTC)
+    dated = stored_event(summary="Dated", start=start)
+    dated.events[0].add(
+        'rdate',
+        [start + timedelta(minutes=minute) for minute in range(1, 1501)]
+    )
+    expanded = []
+    monkeypatch.setattr(
+        icloud.icalendar_searcher.Searcher,
+        'check_component',
+        record_expansions(expanded)
+    )
+    components, complete = icloud._occurrences(
+        dated,
+        start,
+        start + timedelta(days=2),
+        icloud._deadline()
+    )
+    assert expanded == []
+    assert complete is False
+    assert [str(event['SUMMARY']) for event in components] == ['Dated']
+
+    calendar = FakeCalendar(stored=[dated, stored_event(summary="Dentist")])
+    use_calendar(monkeypatch, calendar)
+    events = icloud.list_events('2026-11-13', '2026-11-15', calendar='Home')
+    by_summary = {event['summary']: event for event in events}
+    assert len(events) == 2
+    assert by_summary['Dated']['occurrences_omitted'] is True
+    assert 'occurrences_omitted' not in by_summary['Dentist']
+
+
+def test_overrides_count_before_anything_is_expanded():
+    start = datetime(2026, 11, 13, 15, tzinfo=UTC)
+    series = stored_event(summary="Series", start=start, rrule='FREQ=DAILY')
+    for day in range(1, icloud.MAX_EVENTS + 1):
+        moved = icalendar.Event.new(
+            uid='uid-Series',
+            summary="Moved",
+            start=start + timedelta(days=day, hours=1),
+            end=start + timedelta(days=day, hours=2)
+        )
+        moved.add('recurrence-id', start + timedelta(days=day))
+        series.add_component(moved)
+    components, complete = icloud._occurrences(
+        series,
+        start,
+        start + timedelta(days=1),
+        icloud._deadline()
+    )
+    assert complete is False
+    assert [str(event['SUMMARY']) for event in components] == ['Series']
+
+
+def test_a_few_explicit_dates_are_listed_like_any_occurrence(monkeypatch):
+    start = datetime(2026, 11, 13, 15, tzinfo=UTC)
+    dated = stored_event(summary="Dated", start=start, rrule='FREQ=WEEKLY')
+    dated.events[0].add(
+        'rdate',
+        [start + timedelta(days=1), start + timedelta(days=40)]
+    )
+    use_calendar(monkeypatch, FakeCalendar(stored=[dated]))
+    events = icloud.list_events('2026-11-13', '2026-11-23', calendar='Home')
+    assert [event['start'][:10] for event in events] == [
+        '2026-11-13',
+        '2026-11-14',
+        '2026-11-20',
+    ]
+    assert not any('occurrences_omitted' in event for event in events)
 
 
 def test_rules_of_one_event_are_costed_together():

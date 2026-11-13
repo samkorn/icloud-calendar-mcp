@@ -99,12 +99,20 @@ nothing in the code reads it). Tests: `uv run pytest`.
   unexpanded, marked `occurrences_omitted`. `caldav` is asked for
   `expand=False, post_filter=False` because either option expands
   everything with no limit.
-- **The expansion budget is enforced, not only estimated.** `_too_costly`
-  estimates the cost of a stored event's rules, counting how long each
-  occurrence lasts and adding the rules together, and turns away the
-  plainly dense ones before any work. No estimate covers every rule: one
-  that can never match again (`BYMONTH=2;BYMONTHDAY=30`) is walked to the
-  year 9999. So `_bounded` runs the expansion under `sys.settrace`, which
+- **How many occurrences an expansion can produce is limited before it
+  starts** (`_too_costly`). The library hands back one list it has
+  already built, so cutting it off afterwards would be too late. The
+  count takes in every component (the event and its overrides), every
+  explicit date (`RDATE`, in the range or not) and an upper estimate of
+  what each rule puts in the range, counting how long an occurrence
+  lasts. Over 1000, the event is listed once, unexpanded. Measured on
+  synthetic data: an occurrence shares its text with the event rather
+  than copying it, so a long description is not multiplied.
+- **How long an expansion can run is enforced while it runs.** The same
+  estimate turns away the plainly dense rules, but no estimate of the
+  steps covers every rule: one that can never match again
+  (`BYMONTH=2;BYMONTHDAY=30`) is walked to the year 9999. So `_bounded`
+  runs the expansion under `sys.settrace`, which
   calls back on every Python function call the libraries make, and raises
   from inside them after 2 seconds of the thread's processor time or at
   the tool call's deadline. Processor time, so a slow or busy container
@@ -215,8 +223,16 @@ reject every request that doesn't come from its owner's Claude account.
   connector settings let each tool be allowed, gated on approval, or
   blocked, grouped by the `readOnlyHint` annotations in `server.py`, so
   keep those annotations right. A server-side read-only switch was
-  considered and left out: it would only add protection against a leaked
-  token, which already exposes every calendar.
+  considered and left out.
+- **The server has no boundary between calendars.** The token reaches
+  every calendar and all five tools, so nothing in the server stops a
+  model that event text has misled from reading another calendar or
+  changing an event. What stands in the way is on the client: the tools
+  that write need approval by default, and can be blocked. Claude's
+  settings page says it does not ask in every mode, so blocking is the
+  only setting to count on. A server-side limit on which calendars can be
+  read or written would be a real boundary and does not exist; adding
+  one is the maintainer's decision.
 - **Secrets live in a Modal Secret**, never in the repo or the image. `.env`
   is for local runs only and is gitignored.
 - **App-specific password blast radius.** Apple's app-specific passwords are
@@ -250,12 +266,16 @@ reject every request that doesn't come from its owner's Claude account.
   this.
 - **Request bodies are capped at 256 KiB** (`BodyLimitMiddleware`), after
   the token check and before any parsing.
-- **Event text is someone else's input.** A collaborator on a shared
-  calendar, or anyone who sends an invitation, can put text in an event.
-  The server instructions tell the model to treat it as data.
+- **Calendar names and event text are someone else's input.** A
+  collaborator on a shared calendar, or anyone who sends an invitation,
+  can put text in an event, and whoever shares a calendar names it. The
+  server instructions tell the model to treat everything the tools
+  return as data, and not to act on requests found in it. That is advice
+  to the model, not a boundary (see above).
 - **Verified against a real iCloud account (November 2026):** iCloud
-  gives looked-up events strong ETags, refuses a conditional delete of a
-  version that has since changed, and accepts one of the current version.
+  gives looked-up events strong ETags, refuses a conditional save or
+  delete of a version that has since changed, and accepts either for the
+  current version.
   The listing matched what `caldav`'s own expansion returned, event for
   event, over a two-week and a ninety-day range.
 - **Verified on a real deployment (November 2026):** calls from Claude's

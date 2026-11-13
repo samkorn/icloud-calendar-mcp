@@ -710,16 +710,24 @@ def _too_costly(
 ) -> bool:
     """Estimate whether expanding a stored event would blow the budget.
 
-    This only spares the work of starting on a rule that is plainly too
-    dense. The limit that holds for every rule is the one in _bounded.
+    Counts everything that can become an occurrence: each component (the
+    event and its per-occurrence overrides), each explicit date (RDATE)
+    whether or not it is in the range, and what each rule puts in the
+    range, rounded up. The library returns the occurrences as one list
+    it has already built, so their number has to be limited from here.
+
+    The steps are another matter: for those this only spares starting on
+    a rule that is plainly too dense. The limit that holds for every
+    rule is the one in _bounded.
     """
     steps = 0
     found = 0
     for component in events:
+        found += 1 + len(component.rdates)
         for rule in _rules(component):
             cost = _rule_cost(rule, component, range_start, range_end)
             steps += cost[0]
-            found += cost[1]
+            found += cost[1] + 1
     return steps > MAX_RULE_STEPS or found > MAX_EVENTS
 
 
