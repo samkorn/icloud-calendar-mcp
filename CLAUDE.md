@@ -231,8 +231,12 @@ reject every request that doesn't come from its owner's Claude account.
   that write need approval by default, and can be blocked. Claude's
   settings page says it does not ask in every mode, so blocking is the
   only setting to count on. A server-side limit on which calendars can be
-  read or written would be a real boundary and does not exist; adding
-  one is the maintainer's decision.
+  written to would be a real boundary. It was weighed after a security
+  review raised this and left out, as an accepted risk: writes need
+  approval by default, blocking the write tools is reliable, and the
+  setting would be one more thing to configure. The risk is still there
+  for anyone who sets the write tools to always allowed, or uses a mode
+  in which Claude does not ask.
 - **Secrets live in a Modal Secret**, never in the repo or the image. `.env`
   is for local runs only and is gitignored.
 - **App-specific password blast radius.** Apple's app-specific passwords are
