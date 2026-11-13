@@ -59,6 +59,12 @@ Fill in `.env`:
   after `Bearer ` (the token ID and secret joined by a period) as the value.
   The secret is shown only this once.
 
+  A proxy token is not tied to one app. Unless your workspace uses Modal's
+  [RBAC](https://modal.com/docs/guide/rbac), where tokens are limited to the
+  environments you pick, it is accepted by every proxy-protected endpoint
+  in the workspace. If you run other endpoints that rely on proxy auth
+  alone, this token opens those too, so think about where you paste it.
+
 ## Run locally
 
 ```bash
@@ -115,6 +121,14 @@ In Claude, open Customize > Connectors > Add custom connector:
 - Request headers: name `authorization`, value `Bearer <your MCP_AUTH_TOKEN>`
   (type the `Bearer ` prefix yourself)
 
+Once it is added, the connector's page in the same settings lists the five
+tools, and each can be set to always allowed, needing approval, or blocked.
+To let Claude see your calendars without being able to change them, block
+`create_event`, `update_event` and `delete_event`. "Needs approval" is the
+default for those three, but the note on that page says Claude does not ask
+in every mode, so block a tool you never want used rather than count on
+being asked.
+
 The request headers option is in beta and not on every account. Claude does
 not let you edit a connector's authentication afterwards, so to change the
 token: create a new proxy token, put it in `.env`, recreate the Modal Secret
@@ -147,5 +161,7 @@ Past the token check, the server:
 - deletes an event only if it hasn't changed since it was looked up.
 
 Titles and descriptions on shared calendars and invitations are written by
-other people. Claude is told to treat them as data, but keep your client's
-confirmation prompts on for the tools that change things.
+other people. Claude is told to treat them as data, but keep approval on for
+the tools that change things, or block them (see "Add it to Claude").
+
+To report a security problem, see [SECURITY.md](SECURITY.md).

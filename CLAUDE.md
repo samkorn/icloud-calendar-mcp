@@ -58,6 +58,10 @@ Flat modules at the repo root, no package and no build system:
   tests for the limits, timeouts and error handling. `conftest.py` stops
   FastMCP from reading `.env` when the tests import it.
 
+- `.github/workflows/checks.yml`: runs the tests and audits the locked
+  packages on every push to `main`, every pull request, and weekly.
+- `SECURITY.md`: how to report a vulnerability privately.
+
 Local run: `uv run --env-file .env python server.py` (uv loads `.env`, so
 nothing in the code reads it). Tests: `uv run pytest`.
 
@@ -172,6 +176,17 @@ reject every request that doesn't come from its owner's Claude account.
     and re-adding the connector.
   - Custom header names need Anthropic approval; `authorization` is on the
     standard list, so use that rather than inventing one.
+- **A proxy token is wider than this app.** Without Modal RBAC it is valid
+  for every proxy-protected web endpoint in the workspace; with RBAC, for
+  the environments it was given. The README warns about this. The app's
+  own comparison against `MCP_AUTH_TOKEN` is why another token from the
+  same workspace doesn't open this server.
+- **Read-only use is a client setting, not a server one.** Claude's
+  connector settings let each tool be allowed, gated on approval, or
+  blocked, grouped by the `readOnlyHint` annotations in `server.py`, so
+  keep those annotations right. A server-side read-only switch was
+  considered and left out: it would only add protection against a leaked
+  token, which already exposes every calendar.
 - **Secrets live in a Modal Secret**, never in the repo or the image. `.env`
   is for local runs only and is gitignored.
 - **App-specific password blast radius.** Apple's app-specific passwords are
@@ -215,6 +230,10 @@ reject every request that doesn't come from its owner's Claude account.
   before the app sees a request anyway.
 - **What isn't bounded:** the size of a response from iCloud. `caldav`
   buffers it whole and offers no cap.
+- **One `caldav` client is shared by all threads.** The HTTP library under
+  it (niquests) documents its sessions as thread-safe, and a live run of
+  concurrent requests across many calendars returned exactly what the
+  sequential code did.
 
 Alternatives considered and not chosen:
 
@@ -251,6 +270,10 @@ The repo is written so that a stranger can deploy their own copy:
 - Nothing personal in tracked files (see Public and private notes).
   Everything user-specific comes from secrets and config.
 - README should stay accurate for someone setting it up from scratch.
+- `SECURITY.md` sends reports to GitHub's private vulnerability
+  reporting, which exists only on public repositories and has to be
+  switched on in the repository settings when this one goes public.
+  Secret scanning with push protection is the same.
 - No license has been chosen yet; don't add one without the maintainer
   deciding.
 
@@ -267,9 +290,13 @@ The repo is written so that a stranger can deploy their own copy:
   group. `icalendar`, `icalendar-searcher`, `starlette` and `uvicorn` come
   in with those but are declared too, because the code imports them. Add
   more only when the code needs them.
-- Audit the locked packages for known vulnerabilities after changing them:
-  export with `uv export --frozen --no-dev --no-emit-project`, then run
-  `uv tool run pip-audit --require-hashes --disable-pip -r` on the result.
+- CI audits the locked packages for known vulnerabilities on every push
+  and once a week. To run it by hand: export with `uv export --frozen
+  --no-dev --no-emit-project`, then run `uv tool run pip-audit
+  --require-hashes --disable-pip -r` on the result.
+- CI pins its actions to commits and uv to the version the Modal image
+  uses. Raise those on purpose. The workflow uses no secrets, so it can run
+  on pull requests from forks; keep it that way.
 - Run Modal through the project env: `uv run modal ...`.
 
 ## Secrets
