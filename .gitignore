@@ -4,6 +4,8 @@ venv/
 
 # Secrets
 .env
+.env.*
+!.env.example
 
 # Private Claude Code notes (see CLAUDE.md)
 CLAUDE.local.md

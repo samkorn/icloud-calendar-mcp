@@ -43,7 +43,7 @@ def test_offset_time_is_converted_to_the_named_timezone():
     ]
 )
 def test_unusable_times_are_rejected(value, timezone):
-    with pytest.raises(ValueError):
+    with pytest.raises(icloud.CalendarError):
         icloud._parse_time(value, timezone)
 
 
@@ -54,9 +54,9 @@ def test_date_bound_is_midnight_in_the_timezone():
 
 def test_span_must_be_ordered_and_of_one_kind():
     start = datetime(2026, 11, 13, 15, tzinfo=UTC)
-    with pytest.raises(ValueError):
+    with pytest.raises(icloud.CalendarError):
         icloud._check_span(start, start)
-    with pytest.raises(ValueError):
+    with pytest.raises(icloud.CalendarError):
         icloud._check_span(date(2026, 11, 13), start)
     icloud._check_span(start, start + timedelta(hours=1))
 
@@ -108,7 +108,7 @@ def test_reschedule_with_only_start_keeps_duration():
 def test_rrule_accepts_optional_prefix_and_rejects_garbage():
     rule = icloud._parse_rrule('RRULE:FREQ=WEEKLY;BYDAY=MO,WE')
     assert rule['FREQ'] == ['WEEKLY']
-    with pytest.raises(ValueError):
+    with pytest.raises(icloud.CalendarError):
         icloud._parse_rrule('every other week')
 
 

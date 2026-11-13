@@ -49,11 +49,14 @@ Flat modules at the repo root, no package and no build system:
 - `auth.py`: `BearerAuthMiddleware`, a plain ASGI wrapper around the whole
   app. Chosen over FastMCP's auth providers so a bad token gets a bare 401
   with no OAuth discovery metadata, and every route is covered.
-- `icloud.py`: all CalDAV work. No FastMCP imports.
-- `server.py`: the FastMCP tools (thin wrappers over `icloud.py`) and
-  `build_app()`. `python server.py` serves on 127.0.0.1:8000.
+- `icloud.py`: all CalDAV work, and the limits on it. No FastMCP imports.
+- `server.py`: the FastMCP tools (thin wrappers over `icloud.py`), the
+  error boundary they all go through (`_run`), and `build_app()`.
+  `python server.py` serves on 127.0.0.1:8000.
 - `modal_app.py`: Modal image and the `web` ASGI function.
-- `tests/`: pytest, no network.
+- `tests/`: pytest, no network. `test_safety.py` holds the regression
+  tests for the limits, timeouts and error handling. `conftest.py` stops
+  FastMCP from reading `.env` when the tests import it.
 
 Local run: `uv run --env-file .env python server.py` (uv loads `.env`, so
 nothing in the code reads it). Tests: `uv run pytest`.
@@ -83,6 +86,32 @@ nothing in the code reads it). Tests: `uv run pytest`.
 - **Recurring events:** listed expanded per occurrence, created with an
   `rrule` argument, updated and deleted as a whole series. Editing a single
   occurrence is not implemented. Attendees and alarms are out of scope.
+- **`list_events` expands recurrences itself, not through `caldav`.** The
+  library underneath walks a rule from the event's first date, one step
+  per interval, and can't be stopped part-way: an hourly rule that began
+  decades ago takes seconds, a per-second one minutes. Events can come from
+  shared calendars, so the cost of each stored rule is estimated first
+  (`_too_dense`), and a rule over budget is listed once, unexpanded, marked
+  `occurrences_omitted`. `caldav` is asked for `expand=False,
+  post_filter=False` because either option expands everything with no
+  limit.
+- **Limits are constants at the top of `icloud.py`:** a 366-day range, 1000
+  events and 300,000 characters per listing, a length cap per text
+  argument, 20 seconds per iCloud request and 45 per tool call. Over a
+  limit the call fails with a message saying how to narrow it; it never
+  returns part of a list as if it were all of it.
+- **New rules are checked strictly** (`_parse_rrule`): daily or less
+  often, positive `INTERVAL` and `COUNT`, not both `COUNT` and `UNTIL`.
+  `icalendar` alone accepts `INTERVAL=0` and `COUNT=-1`.
+- **Arguments are checked before anything is written,** and the reply is
+  built before the write. An error after a successful write would invite a
+  retry and a duplicate event. When a write fails without an answer from
+  iCloud, the error says the outcome is unknown.
+- **Deletes are conditional** (`If-Match` with the ETag from the lookup),
+  so an event another client changed in between is not deleted. With no
+  usable ETag the delete is refused, never sent unconditionally. `caldav`
+  already does the same for saves. This covers the moment between lookup
+  and write, not the time since the user last saw the event.
 - **Stateless HTTP with JSON responses** (`stateless_http=True`,
   `json_response=True`), so nothing depends on a container staying alive.
 - **`caldav` is used with `features='icloud'`**, which makes the library
@@ -95,14 +124,17 @@ nothing in the code reads it). Tests: `uv run pytest`.
   contents when it repairs malformed data, which would put calendar data in
   the Modal logs.
 - **Per-calendar requests run concurrently** (`_per_calendar` in
-  `icloud.py`, 8 threads). iCloud needs one request per calendar. On an
+  `icloud.py`), on one pool of 8 threads shared by the whole process, so
+  simultaneous tool calls can't multiply the requests in flight. iCloud
+  needs one request per calendar. On an
   account with many calendars, a week's listing took about 5 seconds run in
   sequence and 1 to 2 run concurrently. A year-wide `query` search is still
   slow (about 8 seconds on that account), since it downloads every event in
   the range.
 - **Modal sizing:** `cpu=0.125`, `memory=256`, `max_containers=1`,
-  `scaledown_window=60`. The single-container cap bounds what a flood of
-  requests could cost.
+  `scaledown_window=60`, `timeout=90`. The single-container cap bounds what
+  a flood of requests could cost. uv is pinned in the image build
+  (`uv_version`) so a rebuild doesn't pick up whatever uv is newest.
 - **Modal Secret name:** `icloud-calendar-mcp`.
 
 ## Security
@@ -148,6 +180,34 @@ reject every request that doesn't come from its owner's Claude account.
   account.apple.com.
 - **Never log** the token, the app password, request headers, or calendar
   contents.
+- **Errors go through one boundary** (`_run` in `server.py`). The client
+  gets a message written for it and the log gets the tool name, the
+  exception's class and the time taken. Never put `str(error)` in either:
+  `caldav` errors carry URLs and response bodies, and an error that lists
+  calendar names puts them in the logs. `icloud.CalendarError` is the one
+  exception whose message may be shown, so its messages must not quote
+  input or calendar data. `mask_error_details=True` is only the backstop.
+- **FastMCP logs tool arguments at DEBUG.** `server.py` holds that one
+  logger at INFO, because the arguments include event text.
+- **Host and Origin are checked** (FastMCP's `host_origin_protection`).
+  Locally only loopback hosts are accepted; the Modal app adds
+  `*.modal.run` (`ALLOWED_HOSTS` in `modal_app.py`). A request carrying an
+  `Origin` header is refused unless it is the server's own origin; Claude's
+  connector calls from a server and sends none. The bearer check stays
+  outermost, so a request without the token learns nothing about any of
+  this.
+- **Request bodies are capped at 256 KiB** (`BodyLimitMiddleware`), after
+  the token check and before any parsing.
+- **Event text is someone else's input.** A collaborator on a shared
+  calendar, or anyone who sends an invitation, can put text in an event.
+  The server instructions tell the model to treat it as data.
+- **Not verified on a real deployment:** that Modal passes the public
+  `Host` header through to the app, that Claude's connector sends no
+  `Origin`, and that iCloud's ETags work with the conditional delete. The
+  unit tests cover the logic, not those three facts. Check them after the
+  next deploy, with a throwaway event for the delete.
+- **What isn't bounded:** the size of a response from iCloud. `caldav`
+  buffers it whole and offers no cap.
 
 Alternatives considered and not chosen:
 
@@ -197,8 +257,12 @@ The repo is written so that a stranger can deploy their own copy:
   deploy with "Unsupported Python version". Raise the setting in the Modal
   dashboard, or run the deploy with `MODAL_IMAGE_BUILDER_VERSION=2026.10`.
 - Dependencies: `modal`, `fastmcp`, `caldav`, plus `pytest` in the dev
-  group. `icalendar` and `uvicorn` are imported directly but come in with
-  `caldav` and `fastmcp`. Add more only when the code needs them.
+  group. `icalendar`, `icalendar-searcher`, `starlette` and `uvicorn` come
+  in with those but are declared too, because the code imports them. Add
+  more only when the code needs them.
+- Audit the locked packages for known vulnerabilities after changing them:
+  export with `uv export --frozen --no-dev --no-emit-project`, then run
+  `uv tool run pip-audit --require-hashes --disable-pip -r` on the result.
 - Run Modal through the project env: `uv run modal ...`.
 
 ## Secrets
