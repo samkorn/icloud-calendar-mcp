@@ -392,3 +392,7 @@ with it. Keep approval on for the tools that change things, or block them
 (see step 9).
 
 To report a security problem, see [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE).
