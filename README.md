@@ -9,6 +9,9 @@ It authenticates to iCloud with an Apple
 [app-specific password](https://support.apple.com/en-us/102654), and Claude
 authenticates to the server with a bearer token.
 
+This is a personal project. It is not affiliated with or endorsed by Apple,
+Anthropic or Modal.
+
 ## Tools
 
 | Tool             | What it does                                              |
@@ -20,8 +23,15 @@ authenticates to the server with a bearer token.
 | `delete_event`   | Delete an event                                           |
 
 Recurring events are listed one occurrence at a time, but `update_event` and
-`delete_event` act on the whole series. Invitations, attendees and alerts are
-not supported.
+`delete_event` act on the whole series. The tools can't invite anyone, add
+attendees or set alerts.
+
+Events that already have invitees are a special case. iCloud may notify
+them when such an event is changed or deleted, so `list_events` marks it
+`has_invitees`, and `update_event` and `delete_event` refuse it until they
+are called again with `invitees_confirmed`. Claude is told to ask you first,
+and to say that invitees may be notified. Whether iCloud really sends
+anything has not been tested, hence "may".
 
 One `list_events` call covers at most 366 days and 1000 events; past that it
 fails and says so, rather than returning part of the list. New recurring
@@ -83,9 +93,10 @@ uv sync
 
 This downloads Python 3.14 if you don't have it, creates a `.venv` folder
 here, and installs the exact package versions recorded in `uv.lock`,
-including Modal's command-line tool. Nothing is installed outside this
-folder. Every command from here on starts with `uv run`, which runs it
-inside that environment.
+including Modal's command-line tool. Nothing is installed system-wide: the
+packages go in this folder, and uv keeps the Python it downloads and its
+cache in your home directory. Every command from here on starts with
+`uv run`, which runs it inside that environment.
 
 ### 3. Connect to Modal
 
@@ -364,8 +375,12 @@ Past the token check, the server:
 - accepts at most 8 MiB from iCloud in answer to one request;
 - stops working out a recurring event's occurrences after 2 seconds of
   processor time, and lists it once instead;
-- reports errors and warnings without calendar names, event text or
-  iCloud's replies, in both the response and the logs;
+- reports errors and warnings from calendar operations without calendar
+  names, event text or iCloud's replies, in both the response and the
+  logs (an argument of the wrong type is refused earlier, and that reply
+  quotes the argument back to whoever sent it);
+- fails a listing if iCloud left out an event's data and it couldn't be
+  fetched, rather than return the list without that event;
 - changes or deletes an event only if it hasn't changed since it was
   looked up.
 

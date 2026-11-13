@@ -42,5 +42,5 @@ copy, pull and redeploy to pick up fixes.
 ## If your own token or password leaks
 
 That is not a bug in this project, but act quickly: replace the token as
-described under "Add it to Claude" in the README, and revoke the
+described under "Change the token" in the README, and revoke the
 app-specific password at [account.apple.com](https://account.apple.com).

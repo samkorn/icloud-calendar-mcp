@@ -7,8 +7,8 @@ calendars. Each user deploys their own copy to Modal and adds it to their
 Claude account as a custom connector, so every Claude surface (web, desktop,
 mobile, cloud scheduled tasks) can use it, not only ones with shell access.
 
-Claude's connector directory has no iCloud calendar integration; this fills
-that gap.
+When this was written (November 2026), Claude's connector directory had no
+iCloud calendar integration; this fills that gap.
 
 ## Public and private notes
 
@@ -60,7 +60,10 @@ Flat modules at the repo root, no package and no build system:
   `.env` when the tests import it.
 
 - `.github/workflows/checks.yml`: runs the tests and audits the locked
-  packages on every push to `main`, every pull request, and weekly.
+  packages on every push to `main`, every pull request, and weekly. GitHub
+  switches a scheduled workflow off after 60 days without activity in a
+  public repository, so the weekly run stops if the repo goes quiet;
+  Dependabot alerts don't.
 - `SECURITY.md`: how to report a vulnerability privately.
 
 Local run: `uv run --env-file .env python server.py` (uv loads `.env`, so
@@ -90,7 +93,21 @@ nothing in the code reads it). Tests: `uv run pytest`.
   timezone setting.
 - **Recurring events:** listed expanded per occurrence, created with an
   `rrule` argument, updated and deleted as a whole series. Editing a single
-  occurrence is not implemented. Attendees and alarms are out of scope.
+  occurrence is not implemented. Adding attendees or alarms is out of
+  scope.
+- **An event that already has invitees needs a second call.** iCloud does
+  the scheduling, so saving or deleting such an event may send its
+  invitees an update, a cancellation or a decline. That has not been
+  tested, and user reports are the only evidence, hence "may". The tools
+  can't make Claude show a prompt: a connector reaches the model only
+  through the server instructions, the tool descriptions and what the
+  tools return. So all three say it. `list_events` marks the event
+  `has_invitees`, `update_event` and `delete_event` refuse it with a
+  message telling the model to ask the user, and they go ahead only when
+  called again with `invitees_confirmed`. The model can set that without
+  asking, so this is a prompt to ask, not a lock. MCP's elicitation, where
+  the server itself asks the user, needs a connection that stays open,
+  which stateless JSON responses don't have.
 - **`list_events` expands recurrences itself, not through `caldav`.** The
   library underneath walks a rule from the event's first date, one step
   per interval, and offers no way to stop it part-way: an hourly rule that
@@ -170,9 +187,10 @@ nothing in the code reads it). Tests: `uv run pytest`.
   doing that, none would be left to do the work. Per-calendar requests
   run concurrently, because iCloud needs one request per calendar. On an
   account with many calendars, a week's listing took about 5 seconds run in
-  sequence and 1 to 2 run concurrently. A year-wide `query` search takes
-  about 3 seconds on that account: it still downloads every event in the
-  range, but expands only the series whose text matches.
+  sequence and 1 to 2 run concurrently. A year-wide `query` search took
+  between 3 and 12 seconds on that account, depending on the year: it
+  still downloads and parses every event in the range, but expands only
+  the series whose text matches.
 - **Modal sizing:** `cpu=0.125`, `memory=256`, `max_containers=1`,
   `scaledown_window=60`, `timeout=90`. The single-container cap bounds what
   a flood of requests could cost. uv is pinned in the image build
@@ -259,6 +277,23 @@ reject every request that doesn't come from its owner's Claude account.
   calendar names puts them in the logs. `icloud.CalendarError` is the one
   exception whose message may be shown, so its messages must not quote
   input or calendar data. `mask_error_details=True` is only the backstop.
+- **Arguments of the wrong type never reach `_run`.** FastMCP refuses
+  them itself, and its reply quotes the value that was sent, whatever
+  `mask_error_details` says. It goes back to the caller who sent it and
+  not into the logs, so nothing is exposed, but "errors never quote
+  input" holds only for errors raised in `icloud.py`.
+- **Whatever `caldav` logs is reduced to where it came from**
+  (`_safe_record` in `icloud.py`, installed as the log record factory for
+  the process). `caldav` logs exceptions that carry request URLs and
+  iCloud's replies, and about ten of those calls go through the root
+  logger, which the level set on the `caldav` logger doesn't reach.
+- **A search that couldn't load every event is an error**
+  (`_load_every_object` in `icloud.py`, which replaces
+  `caldav.Calendar._batch_load_objects`). When iCloud names an event
+  without its data, `caldav` fetches it in a second step, and if that
+  fails it leaves the event out and returns the rest as if complete.
+  Replacing a private method of a library is fragile; the test that
+  covers it runs `caldav`'s real search, so a rename shows up there.
 - **FastMCP logs tool arguments at DEBUG.** `server.py` holds that one
   logger at INFO, because the arguments include event text.
 - **Host and Origin are checked** (FastMCP's `host_origin_protection`).
