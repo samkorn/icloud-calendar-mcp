@@ -25,8 +25,8 @@ not supported.
 
 One `list_events` call covers at most 366 days and 1000 events; past that it
 fails and says so, rather than returning part of the list. New recurring
-events repeat daily or less often. A stored series that repeats too often to
-expand safely (every few seconds, say) is listed once and marked
+events repeat daily or less often. A stored series that costs too much to
+expand (one that repeats every few seconds, say) is listed once and marked
 `occurrences_omitted`.
 
 ## What you need
@@ -332,7 +332,8 @@ in Claude, and revoke the app-specific password at
 
 ## Development
 
-Run the tests. They use no network and need no iCloud account or `.env`:
+Run the tests. They reach nothing beyond a server they start on your own
+machine, and need no iCloud account or `.env`:
 
 ```bash
 uv run pytest
@@ -358,10 +359,15 @@ Past the token check, the server:
 - accepts only requests addressed to its own host (`*.modal.run` when
   deployed; edit `ALLOWED_HOSTS` in `modal_app.py` if you use your own
   domain) and refuses requests that come from a web page;
-- gives up on iCloud after 20 seconds per request and 45 per tool call;
-- reports errors without calendar names, event text or iCloud's replies, in
-  both the response and the logs;
-- deletes an event only if it hasn't changed since it was looked up.
+- gives up on iCloud after 20 seconds of silence on a request and 45
+  seconds per tool call, and sends no change once that time is up;
+- accepts at most 8 MiB from iCloud in answer to one request;
+- stops working out a recurring event's occurrences after 2 seconds of
+  processor time, and lists it once instead;
+- reports errors and warnings without calendar names, event text or
+  iCloud's replies, in both the response and the logs;
+- changes or deletes an event only if it hasn't changed since it was
+  looked up.
 
 Titles and descriptions on shared calendars and invitations are written by
 other people. Claude is told to treat them as data, but keep approval on for

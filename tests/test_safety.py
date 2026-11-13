@@ -1,9 +1,17 @@
 """Limits, timeouts and error handling (no network, synthetic data)."""
 
+import gzip
+import http.server
+import json
 import logging
+import os
+import socketserver
+import subprocess
+import sys
 import threading
 import time
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import caldav
@@ -31,6 +39,36 @@ INITIALIZE = {
 }
 # Stands in for anything private: a calendar name, event text, a URL.
 SECRET = 'SYNTHETIC_PRIVATE_MARKER'
+
+# Lists one stored event, read from stdin, in a process of its own: only
+# there do Python's warnings go where they go on a real server. Logging
+# is turned all the way up, to catch anything else that quotes the event.
+LISTING = """
+import json
+import logging
+import sys
+from types import SimpleNamespace
+
+import icalendar
+
+import icloud
+import server
+
+logging.basicConfig(level=logging.DEBUG)
+data = sys.stdin.read()
+
+
+class Stored:
+    @property
+    def icalendar_instance(self):
+        return icalendar.Calendar.from_ical(data)
+
+
+calendar = SimpleNamespace(search=lambda **arguments: [Stored()])
+icloud._find_calendar = lambda name, deadline: (calendar, 'Home')
+events = server.list_events('2026-11-13', '2026-11-14', calendar='Home')
+print(json.dumps(events))
+"""
 
 
 class FakeCalendar:
@@ -71,6 +109,67 @@ def client(monkeypatch):
     monkeypatch.setenv('MCP_AUTH_TOKEN', TOKEN)
     with TestClient(server.build_app()) as test_client:
         yield test_client
+
+
+class Answers(http.server.BaseHTTPRequestHandler):
+    """Stands in for iCloud: each path answers in a different shape."""
+
+    SMALL = b'<multistatus xmlns="DAV:"/>'
+    LARGE = b'<a>' + b'x' * 200_000 + b'</a>'
+
+    def do_GET(self):
+        body = self.SMALL if self.path == '/small' else self.LARGE
+        self.send_response(207)
+        self.send_header('Content-Type', 'text/xml')
+        if self.path == '/gzip':
+            # A few hundred bytes on the wire.
+            body = gzip.compress(body)
+            self.send_header('Content-Encoding', 'gzip')
+        if self.path not in ('/unsized', '/trickle'):
+            self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if self.path != '/trickle':
+            self.wfile.write(body)
+            return
+        try:
+            # Never silent for long, and never finished.
+            for _ in range(200):
+                self.wfile.write(b' ')
+                self.wfile.flush()
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+    def log_message(self, *arguments):
+        pass
+
+
+@pytest.fixture
+def answers():
+    """Send a request through the limited session to a loopback server."""
+    # Not http.server's own server class: that one looks its host name up
+    # in DNS when it starts.
+    httpd = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Answers)
+    httpd.daemon_threads = True
+    threading.Thread(
+        target=httpd.serve_forever,
+        kwargs={'poll_interval': 0.01},
+        daemon=True
+    ).start()
+    base = f'http://127.0.0.1:{httpd.server_address[1]}'
+    connection = caldav.DAVClient(
+        url=base,
+        username='someone@example.invalid',
+        password='not-a-real-password',
+        timeout=5,
+        # caldav would otherwise look the address up in DNS first.
+        enable_rfc6764=False
+    )
+    icloud._limit_answers(connection)
+    yield lambda path: connection.request(base + path)
+    connection.close()
+    httpd.shutdown()
+    httpd.server_close()
 
 
 @pytest.fixture
@@ -170,9 +269,41 @@ def test_invalid_input_is_not_echoed(client, logs, no_icloud):
     assert SECRET not in '\n'.join(logs)
 
 
+def test_warnings_do_not_quote_what_was_parsed():
+    # icalendar warns about a timezone name of this form, and its warning
+    # repeats the name.
+    zone = f'/{SECRET}/America/New_York'
+    data = '\r\n'.join([
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'BEGIN:VEVENT',
+        'UID:warned',
+        'SUMMARY:Dentist',
+        f'DTSTART;TZID={zone}:20261113T090000',
+        f'DTEND;TZID={zone}:20261113T100000',
+        'END:VEVENT',
+        'END:VCALENDAR',
+        '',
+    ])
+    listing = subprocess.run(
+        [sys.executable, '-c', LISTING],
+        input=data,
+        capture_output=True,
+        text=True,
+        cwd=Path(icloud.__file__).parent,
+        timeout=60
+    )
+    assert listing.returncode == 0
+    assert SECRET not in listing.stderr
+    # Still reported, by kind and by where it was raised.
+    assert 'GloballyUniqueTZIDGuessed raised at ' in listing.stderr
+    [event] = json.loads(listing.stdout)
+    assert event['start'] == '2026-11-13T09:00:00-05:00'
+
+
 def test_requested_data_is_still_returned(client, monkeypatch):
     calendar = FakeCalendar(stored=[stored_event(summary="Dentist")])
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     reply = call_tool(
         client,
         'list_events',
@@ -218,6 +349,11 @@ def test_oversized_text_is_refused_first(no_icloud, field):
         'FREQ=MONTHLY;BYMONTHDAY=40',
         'FREQ=DAILY;NONSENSE=1',
         'INTERVAL=2',
+        'FREQ=DAILY;BYDAY=0MO',
+        'FREQ=WEEKLY;BYDAY=2MO',
+        'FREQ=MONTHLY;BYDAY=6MO',
+        'FREQ=MONTHLY;BYDAY=99MO',
+        'FREQ=DAILY;WKST=1MO',
     ]
 )
 def test_rrule_values_are_checked(rule):
@@ -232,6 +368,7 @@ def test_rrule_values_are_checked(rule):
         'FREQ=WEEKLY;BYDAY=MO,WE;INTERVAL=2',
         'FREQ=MONTHLY;COUNT=6',
         'FREQ=MONTHLY;BYDAY=-1FR',
+        'FREQ=YEARLY;BYDAY=20MO',
         'FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1',
         'FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=13',
         'FREQ=WEEKLY;UNTIL=20261231T000000Z;WKST=SU',
@@ -253,7 +390,7 @@ def test_recurring_event_is_listed_per_occurrence(monkeypatch):
         start=datetime(2026, 11, 30, 9, tzinfo=UTC)
     )
     calendar = FakeCalendar(stored=[weekly, once, elsewhere])
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
 
     events = icloud.list_events('2026-11-09', '2026-11-23', calendar='Home')
     assert [(event['summary'], event['start'][:10]) for event in events] == [
@@ -272,7 +409,7 @@ def test_recurring_event_is_listed_per_occurrence(monkeypatch):
 def test_all_day_event_is_listed_on_its_day(monkeypatch):
     holiday = stored_event(summary="Holiday", start=date(2026, 11, 13))
     calendar = FakeCalendar(stored=[holiday])
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     listed = icloud.list_events(
         '2026-11-13',
         '2026-11-14',
@@ -309,7 +446,7 @@ def test_stored_dense_series_is_listed_once_unexpanded(monkeypatch, rule):
         check=False
     )
     calendar = FakeCalendar(stored=[dense, stored_event(summary="Dentist")])
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     monkeypatch.setattr(
         icloud.icalendar_searcher.Searcher,
         'check_component',
@@ -324,6 +461,107 @@ def test_stored_dense_series_is_listed_once_unexpanded(monkeypatch, rule):
     assert 'occurrences_omitted' not in by_summary['Dentist']
 
 
+@pytest.mark.parametrize(
+    'rule',
+    [
+        # None of these ever matches a date, and no estimate says so: the
+        # library looks for the next occurrence all the way to year 9999.
+        'FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30',
+        'FREQ=HOURLY;BYMONTH=2;BYMONTHDAY=30',
+        'FREQ=MONTHLY;BYDAY=6MO',
+    ]
+)
+def test_rule_that_never_matches_is_stopped_part_way(monkeypatch, rule):
+    barren = stored_event(summary="Barren", rrule=rule, check=False)
+    assert not icloud._too_costly(
+        barren.events,
+        datetime(2026, 11, 13, tzinfo=UTC),
+        datetime(2026, 11, 14, tzinfo=UTC)
+    )
+    calendar = FakeCalendar(stored=[barren, stored_event(summary="Dentist")])
+    use_calendar(monkeypatch, calendar)
+    # Unstopped, the daily rule alone takes many seconds.
+    monkeypatch.setattr(icloud, 'EXPANSION_SECONDS', 0.1)
+    tracing = sys.gettrace()
+
+    began = time.monotonic()
+    events = icloud.list_events('2026-11-13', '2026-11-14', calendar='Home')
+    assert time.monotonic() - began < 2
+    by_summary = {event['summary']: event for event in events}
+    assert by_summary['Barren']['occurrences_omitted'] is True
+    assert 'occurrences_omitted' not in by_summary['Dentist']
+    assert sys.gettrace() is tracing
+
+
+def test_expansion_under_way_stops_at_the_deadline(monkeypatch):
+    barren = stored_event(
+        summary="Barren",
+        rrule='FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30',
+        check=False
+    )
+    # Only the tool call's own deadline can stop it here.
+    monkeypatch.setattr(icloud, 'EXPANSION_SECONDS', 60)
+    began = time.monotonic()
+    components, complete = icloud._occurrences(
+        barren,
+        datetime(2026, 11, 13, tzinfo=UTC),
+        datetime(2026, 11, 14, tzinfo=UTC),
+        began + 0.2
+    )
+    assert time.monotonic() - began < 2
+    assert complete is False
+    assert [str(event['SUMMARY']) for event in components] == ['Barren']
+
+    # As the last event of a listing, it makes the call fail rather than
+    # come back late.
+    use_calendar(monkeypatch, FakeCalendar(stored=[barren]))
+    monkeypatch.setattr(icloud, 'OPERATION_SECONDS', 0.2)
+    with pytest.raises(icloud.CalendarError, match="too long"):
+        icloud.list_events('2026-11-13', '2026-11-14', calendar='Home')
+
+
+def test_long_events_count_for_as_long_as_they_last(monkeypatch):
+    # Hourly, each occurrence lasting fifty days: 1200 of them overlap
+    # any one hour.
+    expanded = []
+    overlapping = stored_event(
+        summary="Overlapping",
+        start=datetime(2026, 9, 24, tzinfo=UTC),
+        duration=timedelta(days=50),
+        rrule='FREQ=HOURLY',
+        check=False
+    )
+    use_calendar(monkeypatch, FakeCalendar(stored=[overlapping]))
+    monkeypatch.setattr(
+        icloud.icalendar_searcher.Searcher,
+        'check_component',
+        record_expansions(expanded)
+    )
+    events = icloud.list_events(
+        '2026-11-13T00:00:00Z',
+        '2026-11-13T01:00:00Z',
+        calendar='Home'
+    )
+    assert expanded == []
+    assert [event['occurrences_omitted'] for event in events] == [True]
+
+
+def test_rules_of_one_event_are_costed_together():
+    start = datetime(2026, 11, 13, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    # About 61,000 steps each: within the budget alone, over it together.
+    event = stored_event(
+        summary="Twice",
+        start=start - timedelta(days=2500),
+        rrule='FREQ=HOURLY;COUNT=5',
+        check=False
+    )
+    assert not icloud._too_costly(event.events, start, end)
+    event.events[0].add('rrule', icalendar.vRecur.from_ical('FREQ=HOURLY'))
+    assert len(icloud._rules(event.events[0])) == 2
+    assert icloud._too_costly(event.events, start, end)
+
+
 def test_too_many_events_is_an_error_not_a_partial_list(monkeypatch):
     daily = [
         stored_event(
@@ -334,7 +572,7 @@ def test_too_many_events_is_an_error_not_a_partial_list(monkeypatch):
         for number in range(4)
     ]
     calendar = FakeCalendar(stored=daily)
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     with pytest.raises(icloud.CalendarError, match="More than 1000"):
         icloud.list_events('2026-01-01', '2027-01-01', calendar='Home')
     # A query that matches one series keeps the others from counting.
@@ -353,9 +591,19 @@ def test_too_much_text_is_an_error(monkeypatch):
         for number in range(40)
     ]
     calendar = FakeCalendar(stored=wordy)
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
+    converted = []
+    convert = icloud._event_to_dict
+
+    def counting(*arguments):
+        converted.append(arguments)
+        return convert(*arguments)
+
+    monkeypatch.setattr(icloud, '_event_to_dict', counting)
     with pytest.raises(icloud.CalendarError, match="too much text"):
         icloud.list_events('2026-11-13', '2026-11-14', calendar='Home')
+    # Refused at the event that went over, not after converting them all.
+    assert len(converted) == icloud.MAX_RESPONSE_CHARS // 9000 + 1
 
 
 def test_requests_share_one_bounded_pool():
@@ -383,6 +631,48 @@ def test_requests_share_one_bounded_pool():
         caller.start()
     for caller in callers:
         caller.join()
+    assert 1 < peak <= icloud.MAX_PARALLEL_REQUESTS
+
+
+def test_lookups_and_writes_use_the_pool_too(monkeypatch):
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+
+    def request():
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.02)
+        with lock:
+            running -= 1
+
+    class SlowCalendar(FakeCalendar):
+        def add_event(self, ical):
+            request()
+            super().add_event(ical)
+
+    calendar = SlowCalendar()
+
+    def get_calendars():
+        request()
+        return [calendar]
+
+    principal = SimpleNamespace(get_calendars=get_calendars)
+    monkeypatch.setattr(icloud, '_principal', lambda: principal)
+    callers = [
+        threading.Thread(
+            target=icloud.create_event,
+            args=('Home', "Lunch", '2026-11-13')
+        )
+        for _ in range(12)
+    ]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join()
+    assert len(calendar.added) == 12
     assert 1 < peak <= icloud.MAX_PARALLEL_REQUESTS
 
 
@@ -418,6 +708,8 @@ def test_client_has_a_timeout_and_no_rate_limit_sleep(monkeypatch):
     class FakeClient:
         def __init__(self, **arguments):
             built.update(arguments)
+            built['client'] = self
+            self.session = SimpleNamespace(close=lambda: None)
 
         def get_principal(self):
             return 'principal'
@@ -432,6 +724,7 @@ def test_client_has_a_timeout_and_no_rate_limit_sleep(monkeypatch):
         icloud._principal.cache_clear()
     assert built['timeout'] == icloud.REQUEST_TIMEOUT
     assert built['rate_limit_handle'] is False
+    assert isinstance(built['client'].session, icloud._LimitedSession)
 
     # The real client keeps both settings where its requests read them.
     monkeypatch.undo()
@@ -472,13 +765,105 @@ def test_stalled_calendar_ends_the_call_at_the_deadline():
 
 def test_expansion_stops_at_the_deadline(monkeypatch):
     calendar = FakeCalendar(stored=[stored_event(summary="Dentist")])
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     monkeypatch.setattr(icloud, 'OPERATION_SECONDS', -1)
     with pytest.raises(icloud.CalendarError, match="too long"):
         icloud.list_events('2026-11-13', '2026-11-14', calendar='Home')
 
 
-# --- Deletes don't destroy someone else's change ----------------------------
+@pytest.mark.parametrize(
+    'call',
+    [
+        lambda: icloud.list_calendars(),
+        lambda: icloud.list_events('2026-11-13', '2026-11-14'),
+        lambda: icloud.create_event('Home', "Lunch", '2026-11-13'),
+        lambda: icloud.update_event('Home', 'abc', summary="Renamed"),
+        lambda: icloud.delete_event('Home', 'abc'),
+    ]
+)
+def test_every_tool_gives_up_at_the_deadline(monkeypatch, call):
+    release = threading.Event()
+
+    def get_calendars():
+        release.wait(timeout=10)
+        return []
+
+    principal = SimpleNamespace(get_calendars=get_calendars)
+    monkeypatch.setattr(icloud, '_principal', lambda: principal)
+    monkeypatch.setattr(icloud, 'OPERATION_SECONDS', 0.2)
+    began = time.monotonic()
+    try:
+        with pytest.raises(icloud.CalendarError, match="too long"):
+            call()
+        assert time.monotonic() - began < 2
+    finally:
+        release.set()
+
+
+def test_nothing_is_written_once_time_is_up(monkeypatch):
+    calendar = FakeCalendar()
+    use_calendar(monkeypatch, calendar)
+    monkeypatch.setattr(icloud, 'OPERATION_SECONDS', -1)
+    with pytest.raises(icloud.CalendarError, match="too long"):
+        icloud.create_event('Home', "Lunch", '2026-11-13')
+    assert calendar.added == []
+
+
+def test_write_still_queued_at_the_deadline_is_never_sent():
+    release = threading.Event()
+    sent = []
+    busy = [
+        icloud._pool.submit(release.wait, 10)
+        for _ in range(icloud.MAX_PARALLEL_REQUESTS)
+    ]
+    try:
+        with pytest.raises(icloud.CalendarError, match="too long"):
+            icloud._write(lambda: sent.append(1), time.monotonic() + 0.2)
+    finally:
+        release.set()
+    for future in busy:
+        future.result(timeout=10)
+    # The pool is free again, and the write did not run late.
+    assert icloud._ask(lambda: 'next', icloud._deadline()) == 'next'
+    assert sent == []
+
+
+def test_write_under_way_at_the_deadline_is_unconfirmed():
+    release = threading.Event()
+    try:
+        with pytest.raises(icloud.CalendarError, match="may or may not"):
+            icloud._write(lambda: release.wait(10), time.monotonic() + 0.2)
+    finally:
+        release.set()
+
+
+# --- iCloud can't send more than the server will hold -----------------------
+
+def test_ordinary_answer_is_read_whole(answers):
+    reply = answers('/small')
+    assert reply.status == 207
+    assert reply.tree.tag == '{DAV:}multistatus'
+
+
+@pytest.mark.parametrize('path', ['/large', '/unsized', '/gzip'])
+def test_oversized_answer_is_cut_off(monkeypatch, answers, path):
+    monkeypatch.setattr(icloud, 'MAX_ICLOUD_BYTES', 64 * 1024)
+    with pytest.raises(icloud._TooMuchData) as raised:
+        answers(path)
+    assert "more data" in icloud.safe_message(raised.value)
+    # The connection is usable for the next request.
+    assert answers('/small').status == 207
+
+
+def test_answer_that_trickles_in_is_cut_off(monkeypatch, answers):
+    monkeypatch.setattr(icloud, 'OPERATION_SECONDS', 0.3)
+    began = time.monotonic()
+    with pytest.raises(TimeoutError):
+        answers('/trickle')
+    assert time.monotonic() - began < 3
+
+
+# --- Changes and deletes don't destroy someone else's change ----------------
 
 def test_delete_names_the_version_it_looked_up(monkeypatch):
     requests = stub_event(monkeypatch, etag='"version-1"', status=204)
@@ -500,11 +885,64 @@ def test_delete_of_a_changed_event_is_a_conflict(monkeypatch):
     assert len(requests) == 1
 
 
+def test_delete_goes_by_the_etag_not_the_schedule_tag(monkeypatch):
+    requests = stub_event(
+        monkeypatch,
+        etag='"version-1"',
+        status=204,
+        schedule_tag='"schedule-1"'
+    )
+    icloud.delete_event('Home', 'abc')
+    assert sent_conditions(requests) == [{'if-match': '"version-1"'}]
+
+
+# A Schedule-Tag is no substitute: it survives some changes to the event.
+@pytest.mark.parametrize('schedule_tag', [None, '"schedule-1"'])
 @pytest.mark.parametrize('etag', [None, 'W/"weak-version"'])
-def test_delete_without_a_usable_version_does_nothing(monkeypatch, etag):
-    requests = stub_event(monkeypatch, etag=etag, status=204)
-    with pytest.raises(icloud.CalendarError, match="can't be deleted safely"):
+def test_delete_without_a_usable_version_does_nothing(
+    monkeypatch,
+    etag,
+    schedule_tag
+):
+    requests = stub_event(
+        monkeypatch,
+        etag=etag,
+        status=204,
+        schedule_tag=schedule_tag
+    )
+    with pytest.raises(icloud.CalendarError, match="no version"):
         icloud.delete_event('Home', 'abc')
+    assert requests == []
+
+
+def test_update_names_the_version_it_looked_up(monkeypatch):
+    requests = stub_event(
+        monkeypatch,
+        etag='"version-1"',
+        status=204,
+        schedule_tag='"schedule-1"'
+    )
+    updated = icloud.update_event('Home', 'abc', summary="Renamed")
+    assert updated['summary'] == "Renamed"
+    assert [request['method'] for request in requests] == ['PUT']
+    assert sent_conditions(requests) == [{'if-match': '"version-1"'}]
+
+
+@pytest.mark.parametrize('schedule_tag', [None, '"schedule-1"'])
+@pytest.mark.parametrize('etag', [None, 'W/"weak-version"'])
+def test_update_without_a_usable_version_does_nothing(
+    monkeypatch,
+    etag,
+    schedule_tag
+):
+    requests = stub_event(
+        monkeypatch,
+        etag=etag,
+        status=204,
+        schedule_tag=schedule_tag
+    )
+    with pytest.raises(icloud.CalendarError, match="no version"):
+        icloud.update_event('Home', 'abc', summary="Renamed")
     assert requests == []
 
 
@@ -512,7 +950,7 @@ def test_delete_without_a_usable_version_does_nothing(monkeypatch, etag):
 
 def test_invalid_timezone_writes_nothing(monkeypatch):
     calendar = FakeCalendar()
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     with pytest.raises(icloud.CalendarError, match="Unknown timezone"):
         icloud.create_event(
             'Home',
@@ -535,7 +973,7 @@ def test_invalid_timezone_on_update_is_refused_first(no_icloud):
 
 def test_create_writes_once_and_returns_the_event(monkeypatch):
     calendar = FakeCalendar()
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     created = icloud.create_event(
         'Home',
         "All day",
@@ -554,7 +992,7 @@ def test_unconfirmed_write_says_so(monkeypatch):
         raise ConnectionError(SECRET)
 
     calendar.add_event = drop
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     with pytest.raises(icloud.CalendarError, match="may or may not"):
         icloud.create_event('Home', "Lunch", '2026-11-13')
 
@@ -632,15 +1070,27 @@ def call_tool(client: TestClient, name: str, **arguments) -> str:
     return reply.text
 
 
+def use_calendar(monkeypatch, calendar) -> None:
+    """Have every calendar name resolve to the given calendar."""
+    monkeypatch.setattr(
+        icloud,
+        '_find_calendar',
+        lambda name, deadline: (calendar, 'Home')
+    )
+
+
 def stored_event(
     summary: str,
     start: date | datetime = datetime(2026, 11, 13, 15, tzinfo=UTC),
     rrule: str | None = None,
     description: str | None = None,
-    check: bool = True
+    check: bool = True,
+    duration: timedelta | None = None
 ) -> icalendar.Calendar:
     """Build an event as another client might have stored it."""
-    if isinstance(start, datetime):
+    if duration is not None:
+        end = start + duration
+    elif isinstance(start, datetime):
         end = start + timedelta(hours=1)
     else:
         end = start + timedelta(days=1)
@@ -669,7 +1119,12 @@ def record_expansions(expanded: list[str]):
     return check_component
 
 
-def stub_event(monkeypatch, etag: str | None, status: int) -> list[dict]:
+def stub_event(
+    monkeypatch,
+    etag: str | None,
+    status: int,
+    schedule_tag: str | None = None
+) -> list[dict]:
     """Make 'abc' in 'Home' a real caldav event on a fake connection.
 
     Returns the list that collects the requests caldav sends for it.
@@ -693,12 +1148,33 @@ def stub_event(monkeypatch, etag: str | None, status: int) -> list[dict]:
         features='icloud'
     )
     connection.request = request
+    parent = caldav.Calendar(
+        client=connection,
+        url=f'{icloud.ICLOUD_URL}/synthetic/'
+    )
     event = caldav.Event(
         client=connection,
-        url=f'{icloud.ICLOUD_URL}/synthetic/abc.ics'
+        url=f'{icloud.ICLOUD_URL}/synthetic/abc.ics',
+        data=stored_event(summary="Dentist").to_ical().decode(),
+        parent=parent
     )
     if etag is not None:
         event.props['{DAV:}getetag'] = etag
+    if schedule_tag is not None:
+        tag = '{urn:ietf:params:xml:ns:caldav}schedule-tag'
+        event.props[tag] = schedule_tag
     calendar = SimpleNamespace(get_event_by_uid=lambda uid: event)
-    monkeypatch.setattr(icloud, '_find_calendar', lambda name: calendar)
+    use_calendar(monkeypatch, calendar)
     return requests
+
+
+def sent_conditions(requests: list[dict]) -> list[dict]:
+    """Return the conditional headers of each request, names lowercased."""
+    return [
+        {
+            name.lower(): value
+            for name, value in request['headers'].items()
+            if name.lower().startswith('if-')
+        }
+        for request in requests
+    ]
