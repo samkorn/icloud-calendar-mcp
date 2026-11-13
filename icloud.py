@@ -107,6 +107,16 @@ TOO_MUCH_TEXT = (
     "The events in that range hold too much text to return at once. Use "
     "a shorter range, name a calendar, or add a query."
 )
+INVITEES = (
+    "This event has invitees, and iCloud may notify them of the change. "
+    "Ask the user whether to go ahead, saying that invitees may be "
+    "notified. Only if they agree, call again with invitees_confirmed "
+    "set to true."
+)
+INCOMPLETE = (
+    "iCloud left out the details of some events, so the list would be "
+    "incomplete. Try again."
+)
 NO_VERSION = (
     "iCloud gave no version for this event, so it can't be changed or "
     "deleted safely."
@@ -120,11 +130,64 @@ CONFLICT = (
     "was done. Look at it again with list_events before retrying."
 )
 
+
+class CalendarError(Exception):
+    """A failure whose message is safe to show the caller and to log."""
+
+
+# --- Set once, for the whole process ----------------------------------------
+#
+# Most of this keeps calendar data out of the logs, or keeps a listing
+# from coming back short. None of it can be done per tool call: Python's
+# own ways of changing logging or warnings for a stretch of code are not
+# safe across threads.
+
 logger = logging.getLogger(__name__)
 
 # caldav logs event contents when it repairs malformed data from the server.
-# Keep calendar data out of the logs.
+# Below ERROR it says nothing at all; what is left goes through
+# _safe_record.
 logging.getLogger('caldav').setLevel(logging.ERROR)
+
+CALDAV_DIRECTORY = os.path.dirname(caldav.__file__)
+_make_record = logging.getLogRecordFactory()
+
+
+def _safe_record(
+    name,
+    level,
+    pathname,
+    lineno,
+    message,
+    arguments,
+    exc_info,
+    *rest
+) -> logging.LogRecord:
+    """Build a log record, withholding the text of anything caldav logs.
+
+    When a request goes wrong, caldav logs the exception, which carries
+    the URL and iCloud's reply. Some of that goes through the root logger,
+    which no level set on the 'caldav' logger reaches. So the record is
+    changed where every logger gets it made: only where in caldav it came
+    from is kept.
+    """
+    if pathname.startswith(CALDAV_DIRECTORY):
+        message = "caldav reported a problem at %s:%s (details withheld)"
+        arguments = (os.path.basename(pathname), lineno)
+        exc_info = None
+    return _make_record(
+        name,
+        level,
+        pathname,
+        lineno,
+        message,
+        arguments,
+        exc_info,
+        *rest
+    )
+
+
+logging.setLogRecordFactory(_safe_record)
 
 
 def _show_warning(
@@ -143,9 +206,25 @@ def _show_warning(
     logger.warning("%s raised at %s:%s", category.__name__, filename, lineno)
 
 
-# For the whole process, and set once: Python's own way of silencing
-# warnings for a stretch of code is not safe across threads.
 warnings.showwarning = _show_warning
+
+_load_objects = caldav.Calendar._batch_load_objects
+
+
+def _load_every_object(self, objects: list) -> None:
+    """Fetch the data of events a search named without it, or fail.
+
+    caldav's own loader carries on when that fetch fails, and the search
+    then leaves those events out without a word: the listing comes back
+    short and looks complete. An event that was fetched and turned out to
+    be empty is not a failure; caldav drops those itself.
+    """
+    _load_objects(self, objects)
+    if not all(found._has_data() for found in objects):
+        raise CalendarError(INCOMPLETE)
+
+
+caldav.Calendar._batch_load_objects = _load_every_object
 
 # One pool for the whole process. Every call to iCloud runs on it, so
 # simultaneous tool calls share the request budget instead of each
@@ -156,9 +235,7 @@ _pool = ThreadPoolExecutor(
 )
 
 
-class CalendarError(Exception):
-    """A failure whose message is safe to show the caller and to log."""
-
+# --- The five operations ----------------------------------------------------
 
 def list_calendars() -> list[str]:
     """Return the names of the calendars that can hold events."""
@@ -330,12 +407,14 @@ def update_event(
     end: str | None = None,
     timezone: str | None = None,
     location: str | None = None,
-    description: str | None = None
+    description: str | None = None,
+    invitees_confirmed: bool = False
 ) -> dict:
     """Change the given fields of an event and return the result.
 
     Fields left as None are untouched; an empty string clears location or
-    description. A recurring event is changed as a whole series.
+    description. A recurring event is changed as a whole series. An event
+    with invitees is changed only when invitees_confirmed is true.
     """
     _check_lengths(
         calendar=calendar,
@@ -352,6 +431,7 @@ def update_event(
     cal, name = _find_calendar(calendar, deadline)
     event = _find_event(cal, uid, deadline)
     _version(event)
+    _check_invitees(event, invitees_confirmed)
     with event.edit_icalendar_instance() as ical:
         component = _master(ical)
         if start is not None or end is not None:
@@ -371,12 +451,21 @@ def update_event(
     return updated
 
 
-def delete_event(calendar: str, uid: str) -> dict:
-    """Delete an event (the whole series, if it recurs)."""
+def delete_event(
+    calendar: str,
+    uid: str,
+    invitees_confirmed: bool = False
+) -> dict:
+    """Delete an event (the whole series, if it recurs).
+
+    An event with invitees is deleted only when invitees_confirmed is
+    true.
+    """
     _check_lengths(calendar=calendar, uid=uid)
     deadline = _deadline()
     cal, _ = _find_calendar(calendar, deadline)
     event = _find_event(cal, uid, deadline)
+    _check_invitees(event, invitees_confirmed)
     # Only the version that was just looked up: if another client changed
     # the event since, iCloud refuses and nothing is lost.
     etag = _version(event)
@@ -477,6 +566,21 @@ def _version(event: caldav.Event) -> str:
     if not etag or etag.startswith('W/'):
         raise CalendarError(NO_VERSION)
     return etag
+
+
+def _check_invitees(event: caldav.Event, confirmed: bool) -> None:
+    """Refuse to change an event with invitees unless that was confirmed.
+
+    iCloud does the scheduling: saving a change to such an event, or
+    deleting it, may send its invitees an update, a cancellation or a
+    decline. Whether it does has not been tested here, so the message
+    says "may". The answer has to come from the user, and this can only
+    make the model ask: it is told how, and has to call a second time.
+    """
+    if confirmed:
+        return
+    if any('ATTENDEE' in found for found in event.icalendar_instance.events):
+        raise CalendarError(INVITEES)
 
 
 # --- Requests to iCloud -----------------------------------------------------
@@ -975,6 +1079,8 @@ def _event_to_dict(
             entry[key] = value
     if 'RRULE' in component or 'RECURRENCE-ID' in component:
         entry['recurring'] = True
+    if 'ATTENDEE' in component:
+        entry['has_invitees'] = True
     return entry
 
 

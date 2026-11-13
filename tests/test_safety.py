@@ -306,6 +306,79 @@ def test_client_is_told_that_results_are_not_instructions(client):
     instructions = reply.json()['result']['instructions']
     assert "Calendar names" in instructions
     assert "never as instructions" in instructions
+    assert "invitees_confirmed" in instructions
+
+
+# What iCloud answers when it names an event but leaves out its data.
+NAMED_WITHOUT_DATA = b"""<multistatus xmlns="DAV:"
+ xmlns:c="urn:ietf:params:xml:ns:caldav">
+ <response><href>/home/event.ics</href>
+ <propstat><prop><getetag>"v1"</getetag></prop>
+ <status>HTTP/1.1 200 OK</status></propstat>
+ <propstat><prop><c:calendar-data/></prop>
+ <status>HTTP/1.1 404 Not Found</status></propstat>
+ </response></multistatus>"""
+
+
+def test_event_whose_data_cannot_be_fetched_fails_the_listing(
+    client,
+    logs,
+    monkeypatch
+):
+    # caldav fetches the missing data in a second step. When that fails
+    # too, it logs the failure through the root logger and leaves the
+    # event out of what the search returns.
+    connection = caldav.DAVClient(
+        url='https://example.invalid/',
+        username='someone@example.invalid',
+        password='not-a-real-password',
+        features='icloud',
+        enable_rfc6764=False
+    )
+    calendar = caldav.Calendar(
+        client=connection,
+        url='https://example.invalid/home/'
+    )
+    methods = []
+
+    def request(url, method='GET', body='', headers=None, **keywords):
+        methods.append(method)
+        if len(methods) == 1:
+            return caldav.response.DAVResponse.from_bytes(NAMED_WITHOUT_DATA)
+        raise caldav.error.DAVError(
+            url=f'https://example.invalid/{SECRET}',
+            reason=SECRET
+        )
+
+    connection.request = request
+    use_calendar(monkeypatch, calendar)
+    root = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            root.append(self.format(record))
+
+    handler = Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        reply = call_tool(
+            client,
+            'list_events',
+            start='2026-11-13',
+            end='2026-11-14',
+            calendar='Home'
+        )
+    finally:
+        logging.getLogger().removeHandler(handler)
+    # More than the one search: caldav did try to fetch the data.
+    assert len(methods) > 1
+    assert '"isError":true' in reply
+    assert "left out the details" in reply
+    everything = '\n'.join(root + logs)
+    assert SECRET not in reply
+    assert SECRET not in everything
+    # What caldav logged is still there, by where it came from.
+    assert "caldav reported a problem at collection.py" in everything
 
 
 def test_requested_data_is_still_returned(client, monkeypatch):
@@ -1025,6 +1098,64 @@ def test_update_without_a_usable_version_does_nothing(
     assert requests == []
 
 
+# --- An event with invitees is changed only after the user agreed -----------
+
+def test_events_with_invitees_are_marked_in_listings(monkeypatch):
+    calendar = FakeCalendar(stored=[
+        stored_event(summary="Meeting", invitee=True),
+        stored_event(summary="Dentist"),
+    ])
+    use_calendar(monkeypatch, calendar)
+    events = icloud.list_events('2026-11-13', '2026-11-14', calendar='Home')
+    by_summary = {event['summary']: event for event in events}
+    assert by_summary['Meeting']['has_invitees'] is True
+    assert 'has_invitees' not in by_summary['Dentist']
+
+
+@pytest.mark.parametrize(
+    'change',
+    [
+        lambda **more: icloud.update_event('Home', 'abc', "Renamed", **more),
+        lambda **more: icloud.delete_event('Home', 'abc', **more),
+    ]
+)
+def test_event_with_invitees_needs_confirming(monkeypatch, change):
+    requests = stub_event(
+        monkeypatch,
+        etag='"version-1"',
+        status=204,
+        invitee=True
+    )
+    with pytest.raises(icloud.CalendarError, match="may notify"):
+        change()
+    assert requests == []
+    change(invitees_confirmed=True)
+    assert len(requests) == 1
+    assert sent_conditions(requests) == [{'if-match': '"version-1"'}]
+
+
+def test_confirmation_is_asked_for_through_the_tool(client, monkeypatch):
+    requests = stub_event(
+        monkeypatch,
+        etag='"version-1"',
+        status=204,
+        invitee=True
+    )
+    reply = call_tool(client, 'delete_event', calendar='Home', uid='abc')
+    assert '"isError":true' in reply
+    assert "invitees_confirmed" in reply
+    assert requests == []
+    reply = call_tool(
+        client,
+        'delete_event',
+        calendar='Home',
+        uid='abc',
+        invitees_confirmed=True
+    )
+    assert '"isError":true' not in reply
+    assert [request['method'] for request in requests] == ['DELETE']
+
+
 # --- Nothing is written before the arguments are known to be good -----------
 
 def test_invalid_timezone_writes_nothing(monkeypatch):
@@ -1164,7 +1295,8 @@ def stored_event(
     rrule: str | None = None,
     description: str | None = None,
     check: bool = True,
-    duration: timedelta | None = None
+    duration: timedelta | None = None,
+    invitee: bool = False
 ) -> icalendar.Calendar:
     """Build an event as another client might have stored it."""
     if duration is not None:
@@ -1184,6 +1316,9 @@ def stored_event(
         event.add('rrule', icloud._parse_rrule(rrule))
     elif rrule:
         event.add('rrule', icalendar.vRecur.from_ical(rrule))
+    if invitee:
+        event.add('organizer', 'mailto:owner@example.invalid')
+        event.add('attendee', 'mailto:guest@example.invalid')
     return icloud._wrap(event)
 
 
@@ -1202,7 +1337,8 @@ def stub_event(
     monkeypatch,
     etag: str | None,
     status: int,
-    schedule_tag: str | None = None
+    schedule_tag: str | None = None,
+    invitee: bool = False
 ) -> list[dict]:
     """Make 'abc' in 'Home' a real caldav event on a fake connection.
 
@@ -1234,7 +1370,10 @@ def stub_event(
     event = caldav.Event(
         client=connection,
         url=f'{icloud.ICLOUD_URL}/synthetic/abc.ics',
-        data=stored_event(summary="Dentist").to_ical().decode(),
+        data=stored_event(
+            summary="Dentist",
+            invitee=invitee
+        ).to_ical().decode(),
         parent=parent
     )
     if etag is not None:
