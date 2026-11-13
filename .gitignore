@@ -8,6 +8,9 @@ venv/
 # Private Claude Code notes (see CLAUDE.md)
 CLAUDE.local.md
 
+# Private working files: reports, scratch notes (see CLAUDE.md)
+.local/
+
 # Python
 __pycache__/
 *.py[cod]

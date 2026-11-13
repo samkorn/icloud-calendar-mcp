@@ -26,6 +26,10 @@ this one, and `.gitignore` keeps it out of the repo. Put there:
 - The state of your own deployment and your own to-do list.
 - Personal working preferences and plans you haven't made public.
 
+Private files that aren't notes (scan reports, scratch work, anything that
+names a deployment) go in `.local/` at the repo root, which is gitignored
+the same way.
+
 For Claude, when recording something in this project:
 
 - Pick the file by the rule above. If it is unclear which side a detail
