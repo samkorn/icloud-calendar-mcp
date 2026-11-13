@@ -206,10 +206,13 @@ reject every request that doesn't come from its owner's Claude account.
   version that has since changed, and accepts one of the current version.
   The listing matched what `caldav`'s own expansion returned, event for
   event, over a two-week and a ninety-day range.
-- **Not verified on a real deployment:** that Modal passes the public
-  `Host` header through to the app, and that Claude's connector sends no
-  `Origin`. The unit tests cover the logic, not those two facts. Check
-  them after the next deploy.
+- **Verified on a real deployment (November 2026):** calls from Claude's
+  connector pass the Host and Origin checks on Modal with
+  `ALLOWED_HOSTS = ['*.modal.run']`, the over-limit error reaches the
+  client as written, and a year-wide `query` search finishes inside the
+  time budget on the smallest container. Not checked there: that a wrong
+  `Host` is refused, since that needs the token, and Modal routes by host
+  before the app sees a request anyway.
 - **What isn't bounded:** the size of a response from iCloud. `caldav`
   buffers it whole and offers no cap.
 
