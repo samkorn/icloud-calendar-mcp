@@ -23,6 +23,12 @@ Recurring events are listed one occurrence at a time, but `update_event` and
 `delete_event` act on the whole series. Invitations, attendees and alerts are
 not supported.
 
+One `list_events` call covers at most 366 days and 1000 events; past that it
+fails and says so, rather than returning part of the list. New recurring
+events repeat daily or less often. A stored series that repeats too often to
+expand safely (every few seconds, say) is listed once and marked
+`occurrences_omitted`.
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/) and a Modal account.
@@ -129,3 +135,17 @@ the same `Authorization` header:
 Anyone who has the token can read and change your calendars: keep it out of
 chats, logs and screenshots, and replace it if it leaks. Secrets live only in
 `.env` (ignored by git) and the Modal Secret.
+
+Past the token check, the server:
+
+- accepts only requests addressed to its own host (`*.modal.run` when
+  deployed; edit `ALLOWED_HOSTS` in `modal_app.py` if you use your own
+  domain) and refuses requests that come from a web page;
+- gives up on iCloud after 20 seconds per request and 45 per tool call;
+- reports errors without calendar names, event text or iCloud's replies, in
+  both the response and the logs;
+- deletes an event only if it hasn't changed since it was looked up.
+
+Titles and descriptions on shared calendars and invitations are written by
+other people. Claude is told to treat them as data, but keep your client's
+confirmation prompts on for the tools that change things.
