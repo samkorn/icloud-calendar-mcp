@@ -3,6 +3,7 @@ name = "icloud-calendar-mcp"
 version = "0.1.0"
 description = "Remote MCP server giving Claude read/write access to iCloud calendars, hosted on Modal."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.14"
 dependencies = [
     "caldav>=3.7.0",

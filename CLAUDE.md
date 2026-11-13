@@ -383,8 +383,9 @@ The repo is written so that a stranger can deploy their own copy:
   reporting, which exists only on public repositories and has to be
   switched on in the repository settings when this one goes public.
   Secret scanning with push protection is the same.
-- No license has been chosen yet; don't add one without the maintainer
-  deciding.
+- The licence is MIT (`LICENSE`): permissive, keeps the copyright notice
+  on every copy, and disclaims warranty. Changing it is the maintainer's
+  decision.
 
 ## Environment
 
