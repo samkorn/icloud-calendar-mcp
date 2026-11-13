@@ -1,0 +1,19 @@
+# Environments
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Private Claude Code notes (see CLAUDE.md)
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# OS / editors
+.DS_Store
