@@ -54,9 +54,10 @@ Flat modules at the repo root, no package and no build system:
   error boundary they all go through (`_run`), and `build_app()`.
   `python server.py` serves on 127.0.0.1:8000.
 - `modal_app.py`: Modal image and the `web` ASGI function.
-- `tests/`: pytest, no network. `test_safety.py` holds the regression
-  tests for the limits, timeouts and error handling. `conftest.py` stops
-  FastMCP from reading `.env` when the tests import it.
+- `tests/`: pytest, no network beyond a loopback server one fixture
+  starts. `test_safety.py` holds the regression tests for the limits,
+  timeouts and error handling. `conftest.py` stops FastMCP from reading
+  `.env` when the tests import it.
 
 - `.github/workflows/checks.yml`: runs the tests and audits the locked
   packages on every push to `main`, every pull request, and weekly.
@@ -92,30 +93,57 @@ nothing in the code reads it). Tests: `uv run pytest`.
   occurrence is not implemented. Attendees and alarms are out of scope.
 - **`list_events` expands recurrences itself, not through `caldav`.** The
   library underneath walks a rule from the event's first date, one step
-  per interval, and can't be stopped part-way: an hourly rule that began
-  decades ago takes seconds, a per-second one minutes. Events can come from
-  shared calendars, so the cost of each stored rule is estimated first
-  (`_too_dense`), and a rule over budget is listed once, unexpanded, marked
-  `occurrences_omitted`. `caldav` is asked for `expand=False,
-  post_filter=False` because either option expands everything with no
-  limit.
+  per interval, and offers no way to stop it part-way: an hourly rule that
+  began decades ago takes seconds, a per-second one minutes. Events can
+  come from shared calendars, so a rule over budget is listed once,
+  unexpanded, marked `occurrences_omitted`. `caldav` is asked for
+  `expand=False, post_filter=False` because either option expands
+  everything with no limit.
+- **The expansion budget is enforced, not only estimated.** `_too_costly`
+  estimates the cost of a stored event's rules, counting how long each
+  occurrence lasts and adding the rules together, and turns away the
+  plainly dense ones before any work. No estimate covers every rule: one
+  that can never match again (`BYMONTH=2;BYMONTHDAY=30`) is walked to the
+  year 9999. So `_bounded` runs the expansion under `sys.settrace`, which
+  calls back on every Python function call the libraries make, and raises
+  from inside them after 2 seconds of the thread's processor time or at
+  the tool call's deadline. Processor time, so a slow or busy container
+  doesn't cut off an ordinary event. The exception is a `BaseException`,
+  so no `except Exception` in a library swallows it. This works because
+  `icalendar`, `recurring-ical-events` and `dateutil` are pure Python; it
+  would not stop a single long call into C. A subprocess that can be
+  killed was the alternative, and was left out for what it costs in
+  memory and start-up on the smallest container.
 - **Limits are constants at the top of `icloud.py`:** a 366-day range, 1000
   events and 300,000 characters per listing, a length cap per text
-  argument, 20 seconds per iCloud request and 45 per tool call. Over a
-  limit the call fails with a message saying how to narrow it; it never
-  returns part of a list as if it were all of it.
+  argument, 8 MiB per answer from iCloud, 2 seconds of processor time per
+  expansion, 20 seconds of silence per iCloud request and 45 seconds per
+  tool call. Over a limit the call fails with a message saying how to
+  narrow it; it never returns part of a list as if it were all of it.
 - **New rules are checked strictly** (`_parse_rrule`): daily or less
-  often, positive `INTERVAL` and `COUNT`, not both `COUNT` and `UNTIL`.
-  `icalendar` alone accepts `INTERVAL=0` and `COUNT=-1`.
+  often, positive `INTERVAL` and `COUNT`, not both `COUNT` and `UNTIL`,
+  plain weekdays in `WKST`, and a numbered `BYDAY` only where it can
+  match (up to 5 monthly, 53 yearly). `icalendar` alone accepts
+  `INTERVAL=0`, `COUNT=-1` and `BYDAY=99MO`. A rule that passes can still
+  never match (February 30th); reading it back is what `_bounded` is for.
 - **Arguments are checked before anything is written,** and the reply is
   built before the write. An error after a successful write would invite a
   retry and a duplicate event. When a write fails without an answer from
   iCloud, the error says the outcome is unknown.
-- **Deletes are conditional** (`If-Match` with the ETag from the lookup),
-  so an event another client changed in between is not deleted. With no
-  usable ETag the delete is refused, never sent unconditionally. `caldav`
-  already does the same for saves. This covers the moment between lookup
-  and write, not the time since the user last saw the event.
+- **Every tool call has one deadline, set on entry and passed down.** Each
+  call to iCloud waits no longer than what is left of it. A write is not
+  sent once it has passed: `_write` checks first, and a write still queued
+  at the deadline is taken out of the queue, so the caller is never told
+  "too slow" about a change that then happens. One already on the wire is
+  reported as unconfirmed.
+- **Changes and deletes are conditional** (`If-Match` with the ETag from
+  the lookup), so an event another client changed in between is not
+  overwritten or deleted. `_version` requires a strong ETag and refuses
+  the write without one. Left alone, `caldav` falls back to a
+  Schedule-Tag, which RFC 6638 lets a server keep through some changes,
+  and sends a save with no condition at all when there is neither. This
+  covers the moment between lookup and write, not the time since the user
+  last saw the event.
 - **Stateless HTTP with JSON responses** (`stateless_http=True`,
   `json_response=True`), so nothing depends on a container staying alive.
 - **`caldav` is used with `features='icloud'`**, which makes the library
@@ -127,10 +155,12 @@ nothing in the code reads it). Tests: `uv run pytest`.
 - **The `caldav` logger is set to ERROR.** At WARNING it prints event
   contents when it repairs malformed data, which would put calendar data in
   the Modal logs.
-- **Per-calendar requests run concurrently** (`_per_calendar` in
-  `icloud.py`), on one pool of 8 threads shared by the whole process, so
-  simultaneous tool calls can't multiply the requests in flight. iCloud
-  needs one request per calendar. On an
+- **Every call to iCloud runs on one pool of 8 threads** shared by the
+  whole process (`_ask`, `_per_calendar` and `_write` in `icloud.py`), so
+  simultaneous tool calls can't multiply the requests in flight. Nothing
+  submitted to the pool may itself wait on the pool: with all 8 threads
+  doing that, none would be left to do the work. Per-calendar requests
+  run concurrently, because iCloud needs one request per calendar. On an
   account with many calendars, a week's listing took about 5 seconds run in
   sequence and 1 to 2 run concurrently. A year-wide `query` search takes
   about 3 seconds on that account: it still downloads every event in the
@@ -195,6 +225,13 @@ reject every request that doesn't come from its owner's Claude account.
   account.apple.com.
 - **Never log** the token, the app password, request headers, or calendar
   contents.
+- **Python warnings are printed by kind and origin only** (`_show_warning`
+  in `icloud.py`, installed as `warnings.showwarning` for the process).
+  A warning's text can quote what was being parsed: `icalendar` warns
+  about an unusual timezone name by repeating it, and the name comes from
+  the event. Warnings don't pass through `_run` or any logger setting, so
+  they need their own rule. `warnings.catch_warnings` around the parsing
+  was not an option: it is not safe across threads.
 - **Errors go through one boundary** (`_run` in `server.py`). The client
   gets a message written for it and the log gets the tool name, the
   exception's class and the time taken. Never put `str(error)` in either:
@@ -228,8 +265,21 @@ reject every request that doesn't come from its owner's Claude account.
   time budget on the smallest container. Not checked there: that a wrong
   `Host` is refused, since that needs the token, and Modal routes by host
   before the app sees a request anyway.
-- **What isn't bounded:** the size of a response from iCloud. `caldav`
-  buffers it whole and offers no cap.
+- **Answers from iCloud are read through `_LimitedSession`,** which
+  replaces the HTTP session `caldav` creates. It reads each answer in
+  16 KiB pieces and stops at 8 MiB after decompression, or once the
+  request has gone on for the length of a tool call. `caldav` alone
+  buffers an answer of any size, and its timeout only limits the silence
+  between two pieces. The session sets a private attribute of the
+  `niquests` response (`_content`) to hand the body on; a test sends real
+  requests through `caldav` to a loopback server, so an upgrade that
+  breaks this fails there.
+- **What isn't bounded:** memory across requests. The cap is per answer,
+  up to 8 answers can be in flight, and a listing holds every calendar's
+  results until it has gone through them, so an account with many very
+  full calendars can still use more memory than the smallest container
+  has. Parsing an event is bounded only by the size of the answer it came
+  in, not by `_bounded`.
 - **One `caldav` client is shared by all threads.** The HTTP library under
   it (niquests) documents its sessions as thread-safe, and a live run of
   concurrent requests across many calendars returned exactly what the
@@ -287,9 +337,9 @@ The repo is written so that a stranger can deploy their own copy:
   deploy with "Unsupported Python version". Raise the setting in the Modal
   dashboard, or run the deploy with `MODAL_IMAGE_BUILDER_VERSION=2026.10`.
 - Dependencies: `modal`, `fastmcp`, `caldav`, plus `pytest` in the dev
-  group. `icalendar`, `icalendar-searcher`, `starlette` and `uvicorn` come
-  in with those but are declared too, because the code imports them. Add
-  more only when the code needs them.
+  group. `icalendar`, `icalendar-searcher`, `niquests`, `starlette` and
+  `uvicorn` come in with those but are declared too, because the code
+  imports them. Add more only when the code needs them.
 - CI audits the locked packages for known vulnerabilities on every push
   and once a week. To run it by hand: export with `uv export --frozen
   --no-dev --no-emit-project`, then run `uv tool run pip-audit

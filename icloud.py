@@ -9,13 +9,15 @@ back. `safe_message` gives the same guarantee for errors from the libraries
 underneath.
 """
 
-import contextlib
 import functools
 import logging
 import math
 import os
+import re
+import sys
 import time as clock
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -23,13 +25,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import caldav
 import icalendar
 import icalendar_searcher
+import niquests
 
 ICLOUD_URL = 'https://caldav.icloud.com'
 PRODID = '-//icloud-calendar-mcp//EN'
 
 # Seconds iCloud may stay silent on one request before it is abandoned.
 REQUEST_TIMEOUT = 20
-# Seconds one tool call may take before it stops starting new work.
+# Seconds one tool call may take. Past that it starts nothing new, an
+# expansion under way is stopped, and no write is sent. It is also the
+# longest any one request may go on being read.
 OPERATION_SECONDS = 45
 # iCloud requests in flight at once, across every tool call in the process.
 MAX_PARALLEL_REQUESTS = 8
@@ -40,10 +45,20 @@ MAX_RANGE_DAYS = 366
 MAX_EVENTS = 1000
 # The most event text (in characters) one call may return.
 MAX_RESPONSE_CHARS = 300_000
-# The most steps a stored recurrence rule may cost to expand. The library
-# walks a rule from the event's first date, one step per FREQ interval, and
-# can't be interrupted, so the cost is estimated before it starts.
+# The most iCloud may send in answer to one request, after decompression.
+MAX_ICLOUD_BYTES = 8 * 1024 * 1024
+# How much of an answer is read at a time. Small, because one read of
+# compressed data can grow about a thousandfold when it is unpacked.
+READ_BYTES = 16 * 1024
+# The most steps a stored event's recurrence rules may be estimated to
+# cost. The library walks a rule from the event's first date, one step per
+# FREQ interval. This turns away the plainly dense rules before any work.
 MAX_RULE_STEPS = 100_000
+# Seconds of processor time expanding one stored event may take. No
+# estimate covers every rule (one that never matches again is walked to
+# the year 9999), so the expansion is timed as it runs and stopped (see
+# _bounded). A rule within the estimate above needs well under a second.
+EXPANSION_SECONDS = 2
 
 TEXT_LIMITS = {
     'calendar': 255,
@@ -59,7 +74,7 @@ TEXT_LIMITS = {
 }
 
 # Recurrence rules this server will create. Stored rules from other apps
-# may use the rest of RFC 5545; those are only bounded (see _too_dense).
+# may use the rest of RFC 5545; those are only bounded (see _occurrences).
 RRULE_FREQUENCIES = {'DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'}
 RRULE_NUMBER_RANGES = {
     'INTERVAL': (1, 1000),
@@ -69,6 +84,10 @@ RRULE_NUMBER_RANGES = {
     'BYSETPOS': (-366, 366),
 }
 RRULE_OTHER_PARTS = {'FREQ', 'UNTIL', 'BYDAY', 'WKST'}
+# A weekday as BYDAY and WKST write it: 'MO', or numbered, '-1FR'.
+WEEKDAY = re.compile(r'([+-]?[1-9][0-9]?)?(MO|TU|WE|TH|FR|SA|SU)')
+# How far a numbered BYDAY may count. Other frequencies take no number.
+RRULE_WEEKDAY_NUMBERS = {'MONTHLY': 5, 'YEARLY': 53}
 FREQUENCY_SECONDS = {
     'SECONDLY': 1,
     'MINUTELY': 60,
@@ -80,6 +99,18 @@ FREQUENCY_SECONDS = {
 }
 
 TOO_SLOW = "iCloud took too long to answer. Try again, or ask for less."
+TOO_MUCH_DATA = (
+    "iCloud sent more data than this server accepts at once. Use a "
+    "shorter range, or name a calendar."
+)
+TOO_MUCH_TEXT = (
+    "The events in that range hold too much text to return at once. Use "
+    "a shorter range, name a calendar, or add a query."
+)
+NO_VERSION = (
+    "iCloud gave no version for this event, so it can't be changed or "
+    "deleted safely."
+)
 UNCONFIRMED = (
     "iCloud did not confirm the change, so it may or may not have been "
     "saved. Check with list_events before trying again."
@@ -89,12 +120,36 @@ CONFLICT = (
     "was done. Look at it again with list_events before retrying."
 )
 
+logger = logging.getLogger(__name__)
+
 # caldav logs event contents when it repairs malformed data from the server.
 # Keep calendar data out of the logs.
 logging.getLogger('caldav').setLevel(logging.ERROR)
 
-# One pool for the whole process, so simultaneous tool calls share the
-# request budget instead of each bringing its own threads.
+
+def _show_warning(
+    message,
+    category,
+    filename,
+    lineno,
+    file=None,
+    line=None
+) -> None:
+    """Report a Python warning by its kind and origin, without its text.
+
+    The text can quote what was being parsed: icalendar's warning about an
+    unusual timezone name repeats the name, which comes from the event.
+    """
+    logger.warning("%s raised at %s:%s", category.__name__, filename, lineno)
+
+
+# For the whole process, and set once: Python's own way of silencing
+# warnings for a stretch of code is not safe across threads.
+warnings.showwarning = _show_warning
+
+# One pool for the whole process. Every call to iCloud runs on it, so
+# simultaneous tool calls share the request budget instead of each
+# bringing its own threads.
 _pool = ThreadPoolExecutor(
     max_workers=MAX_PARALLEL_REQUESTS,
     thread_name_prefix='icloud'
@@ -108,15 +163,15 @@ class CalendarError(Exception):
 def list_calendars() -> list[str]:
     """Return the names of the calendars that can hold events."""
     deadline = _deadline()
-    calendars = _principal().get_calendars()
+    calendars = _calendars(deadline)
     components = _per_calendar(
         lambda calendar: calendar.get_supported_components(),
-        calendars,
+        [calendar for calendar, _ in calendars],
         deadline
     )
     return [
-        calendar.get_display_name()
-        for calendar, supported in zip(calendars, components)
+        name
+        for (_, name), supported in zip(calendars, components)
         if 'VEVENT' in supported
     ]
 
@@ -131,8 +186,8 @@ def list_events(
     """Return events overlapping [start, end), earliest first.
 
     Recurring events are expanded into one entry per occurrence, except a
-    series too dense to expand, which is listed once and marked with
-    'occurrences_omitted'. Raises CalendarError rather than return a
+    series that costs too much to expand, which is listed once and marked
+    with 'occurrences_omitted'. Raises CalendarError rather than return a
     partial list when the range holds more than MAX_EVENTS.
     """
     _check_lengths(
@@ -155,9 +210,9 @@ def list_events(
         raise CalendarError(message)
 
     if calendar:
-        calendars = [_find_calendar(calendar)]
+        calendars = [_find_calendar(calendar, deadline)]
     else:
-        calendars = _principal().get_calendars()
+        calendars = _calendars(deadline)
 
     def search(cal: caldav.Calendar) -> list[caldav.Event]:
         # Neither expanded nor filtered by caldav: both would expand every
@@ -175,17 +230,23 @@ def list_events(
     found = []
     count = 0
     size = 0
-    for cal, results in zip(
-        calendars,
-        _per_calendar(search, calendars, deadline)
-    ):
-        name = cal.get_display_name()
+    searched = _per_calendar(
+        search,
+        [cal for cal, _ in calendars],
+        deadline
+    )
+    for (_, name), results in zip(calendars, searched):
         for result in results:
             _check_deadline(deadline)
             ical = result.icalendar_instance
             if query and not _any_match(ical.events, query):
                 continue
-            components, complete = _occurrences(ical, range_start, range_end)
+            components, complete = _occurrences(
+                ical,
+                range_start,
+                range_end,
+                deadline
+            )
             count += len(components)
             if count > MAX_EVENTS:
                 message = (
@@ -200,14 +261,12 @@ def list_events(
                 if not complete:
                     entry['occurrences_omitted'] = True
                 size += sum(len(str(value)) for value in entry.values())
+                if size > MAX_RESPONSE_CHARS:
+                    raise CalendarError(TOO_MUCH_TEXT)
                 found.append((_sort_key(component.start), entry))
 
-    if size > MAX_RESPONSE_CHARS:
-        message = (
-            "The events in that range hold too much text to return at "
-            "once. Use a shorter range, name a calendar, or add a query."
-        )
-        raise CalendarError(message)
+    # The last event's expansion may be what ran out the clock.
+    _check_deadline(deadline)
     found.sort(key=lambda pair: pair[0])
     return [entry for _, entry in found]
 
@@ -233,6 +292,7 @@ def create_event(
         description=description,
         rrule=rrule
     )
+    deadline = _deadline()
     # Everything that can be wrong with the arguments is found here,
     # before the write: an error afterwards would invite a retry and a
     # duplicate event.
@@ -256,10 +316,9 @@ def create_event(
         event.add('rrule', _parse_rrule(rrule))
     data = _wrap(event).to_ical().decode()
 
-    cal = _find_calendar(calendar)
-    created = _event_to_dict(event, cal.get_display_name(), timezone)
-    with _writing():
-        cal.add_event(ical=data)
+    cal, name = _find_calendar(calendar, deadline)
+    created = _event_to_dict(event, name, timezone)
+    _write(lambda: cal.add_event(ical=data), deadline)
     return created
 
 
@@ -288,9 +347,11 @@ def update_event(
         location=location,
         description=description
     )
+    deadline = _deadline()
     _zone(timezone)
-    cal = _find_calendar(calendar)
-    event = _find_event(cal, uid)
+    cal, name = _find_calendar(calendar, deadline)
+    event = _find_event(cal, uid, deadline)
+    _version(event)
     with event.edit_icalendar_instance() as ical:
         component = _master(ical)
         if start is not None or end is not None:
@@ -302,32 +363,24 @@ def update_event(
         if description is not None:
             _set_text(component, 'DESCRIPTION', description)
         ical.add_missing_timezones()
-    updated = _event_to_dict(component, cal.get_display_name(), timezone)
-    # caldav sends the version it fetched with the save, so iCloud refuses
-    # it if the event changed in between.
-    with _writing():
-        event.save()
+    updated = _event_to_dict(component, name, timezone)
+    # 'etag' has caldav send the version it fetched as the condition (it
+    # was checked above that there is one), so iCloud refuses the save if
+    # the event changed in between.
+    _write(lambda: event.save(precondition='etag'), deadline)
     return updated
 
 
 def delete_event(calendar: str, uid: str) -> dict:
     """Delete an event (the whole series, if it recurs)."""
     _check_lengths(calendar=calendar, uid=uid)
-    cal = _find_calendar(calendar)
-    event = _find_event(cal, uid)
-    with _writing():
-        try:
-            # Only the version that was just looked up: if another client
-            # changed the event since, iCloud refuses and nothing is lost.
-            event.delete(if_match=True, precondition='etag')
-        except ValueError:
-            # caldav has no usable version to send. Don't fall back to
-            # deleting whatever is there.
-            message = (
-                "iCloud gave no version for this event, so it can't be "
-                "deleted safely."
-            )
-            raise CalendarError(message) from None
+    deadline = _deadline()
+    cal, _ = _find_calendar(calendar, deadline)
+    event = _find_event(cal, uid, deadline)
+    # Only the version that was just looked up: if another client changed
+    # the event since, iCloud refuses and nothing is lost.
+    etag = _version(event)
+    _write(lambda: event.delete(if_match=etag), deadline)
     return {'deleted': uid}
 
 
@@ -354,6 +407,8 @@ def safe_message(error: Exception) -> str | None:
         return "iCloud could not find that item. It may have been deleted."
     if isinstance(error, caldav.error.DAVError):
         return "iCloud answered with an error."
+    if isinstance(error, _TooMuchData):
+        return TOO_MUCH_DATA
     # niquests raises OSError subclasses for timeouts and lost connections.
     if isinstance(error, OSError):
         return "Could not reach iCloud, or it stopped answering."
@@ -361,6 +416,134 @@ def safe_message(error: Exception) -> str | None:
 
 
 # --- iCloud lookups ---------------------------------------------------------
+
+def _calendars(deadline: float) -> list[tuple[caldav.Calendar, str]]:
+    """Return every calendar on the account, each with its name."""
+    def fetch():
+        return [
+            (calendar, calendar.get_display_name() or '')
+            for calendar in _principal().get_calendars()
+        ]
+
+    return _ask(fetch, deadline)
+
+
+def _find_calendar(
+    name: str,
+    deadline: float
+) -> tuple[caldav.Calendar, str]:
+    """Return the calendar of that name, and the name as iCloud has it."""
+    calendars = _calendars(deadline)
+    exact = [pair for pair in calendars if pair[1] == name]
+    loose = [
+        pair
+        for pair in calendars
+        if pair[1].casefold() == name.casefold()
+    ]
+    for matches in (exact, loose):
+        if len(matches) == 1:
+            return matches[0]
+    message = (
+        "No single calendar has that name. Use list_calendars to see "
+        "the names."
+    )
+    raise CalendarError(message)
+
+
+def _find_event(
+    calendar: caldav.Calendar,
+    uid: str,
+    deadline: float
+) -> caldav.Event:
+    try:
+        return _ask(lambda: calendar.get_event_by_uid(uid), deadline)
+    except caldav.error.NotFoundError:
+        message = (
+            "No event with that UID in that calendar. Use list_events to "
+            "find it."
+        )
+        raise CalendarError(message) from None
+
+
+def _version(event: caldav.Event) -> str:
+    """Return the ETag naming exactly the version that was looked up.
+
+    A change or delete is sent on condition that the event still has it.
+    Left to itself caldav settles for less when there is no strong ETag:
+    a Schedule-Tag, which stays the same through some changes (RFC 6638),
+    or for a save no condition at all. Here that is refused instead.
+    """
+    etag = event.etag
+    if not etag or etag.startswith('W/'):
+        raise CalendarError(NO_VERSION)
+    return etag
+
+
+# --- Requests to iCloud -----------------------------------------------------
+
+def _ask(call, deadline: float):
+    """Have iCloud answer one call, on the shared pool, by the deadline."""
+    return _wait(_pool.submit(_in_time, call, deadline), deadline)
+
+
+def _per_calendar(
+    function,
+    calendars: list[caldav.Calendar],
+    deadline: float
+) -> list:
+    """Call function once per calendar, concurrently, keeping order.
+
+    Each call is a separate request to iCloud, so running them one after
+    another makes every tool call slower with each calendar on the account.
+    """
+    futures = [
+        _pool.submit(_in_time, functools.partial(function, calendar), deadline)
+        for calendar in calendars
+    ]
+    try:
+        return [_wait(future, deadline) for future in futures]
+    finally:
+        # Drops the calls still queued. One already talking to iCloud runs
+        # on until its request ends or _LimitedSession stops it.
+        for future in futures:
+            future.cancel()
+
+
+def _write(change, deadline: float) -> None:
+    """Make one change at iCloud, or say so if its outcome is unknown.
+
+    A change that has not been sent by the deadline never is: this stops
+    waiting for it then, and takes it back out of the queue.
+    """
+    _check_deadline(deadline)
+    future = _pool.submit(_in_time, change, deadline)
+    try:
+        future.result(timeout=max(0, deadline - clock.monotonic()))
+    except OSError:
+        # Out of time (TimeoutError is an OSError too), a lost connection,
+        # or an answer cut short. If the change was still queued, taking
+        # it out settles the matter. Otherwise it may have gone through.
+        if future.cancel():
+            raise CalendarError(TOO_SLOW) from None
+        raise CalendarError(UNCONFIRMED) from None
+
+
+def _wait(future, deadline: float):
+    try:
+        return future.result(timeout=max(0, deadline - clock.monotonic()))
+    except TimeoutError:
+        if future.done():
+            # The call's own timeout, or an answer that arrived just now.
+            return future.result()
+        future.cancel()
+        raise CalendarError(TOO_SLOW) from None
+
+
+def _in_time(call, deadline: float):
+    """Run a queued call, unless its tool call ran out of time waiting."""
+    _check_deadline(deadline)
+    return call()
+
 
 @functools.cache
 def _principal() -> caldav.Principal:
@@ -375,71 +558,53 @@ def _principal() -> caldav.Principal:
         # the response asks.
         rate_limit_handle=False
     )
+    _limit_answers(client)
     return client.get_principal()
 
 
-def _per_calendar(
-    function,
-    calendars: list[caldav.Calendar],
-    deadline: float
-) -> list:
-    """Call function once per calendar, concurrently, keeping order.
+def _limit_answers(client: caldav.DAVClient) -> None:
+    """Make every request of this client go through _LimitedSession."""
+    client.session.close()
+    client.session = _LimitedSession()
 
-    Each call is a separate request to iCloud, so running them one after
-    another makes every tool call slower with each calendar on the account.
+
+class _LimitedSession(niquests.Session):
+    """Reads iCloud's answers a piece at a time, up to a size and a time.
+
+    caldav buffers a whole answer however large it is, and REQUEST_TIMEOUT
+    only limits the silence between two pieces, not how long an answer
+    that keeps trickling in may take.
     """
-    futures = [_pool.submit(function, calendar) for calendar in calendars]
-    try:
-        return [
-            future.result(timeout=max(0, deadline - clock.monotonic()))
-            for future in futures
-        ]
-    except TimeoutError:
-        raise CalendarError(TOO_SLOW) from None
-    finally:
-        # Drops the calls still queued. One already talking to iCloud runs
-        # on until REQUEST_TIMEOUT stops it.
-        for future in futures:
-            future.cancel()
+
+    def request(self, method, url, **arguments):
+        started = clock.monotonic()
+        arguments['stream'] = True
+        response = super().request(method, url, **arguments)
+        body = bytearray()
+        try:
+            # iter_content undoes any compression, so this counts the
+            # size the answer has in memory, not on the wire.
+            for piece in response.iter_content(READ_BYTES):
+                body += piece
+                if len(body) > MAX_ICLOUD_BYTES:
+                    raise _TooMuchData()
+                if clock.monotonic() - started > OPERATION_SECONDS:
+                    raise TimeoutError()
+        except BaseException:
+            response.close()
+            raise
+        # caldav reads the body from .content, which niquests fills from
+        # this attribute once the stream has been used up.
+        response._content = bytes(body)
+        return response
 
 
-def _find_calendar(name: str) -> caldav.Calendar:
-    calendars = _principal().get_calendars()
-    names = [calendar.get_display_name() or '' for calendar in calendars]
-    pairs = list(zip(calendars, names))
-    exact = [cal for cal, cal_name in pairs if cal_name == name]
-    loose = [
-        cal
-        for cal, cal_name in pairs
-        if cal_name.casefold() == name.casefold()
-    ]
-    for matches in (exact, loose):
-        if len(matches) == 1:
-            return matches[0]
-    message = (
-        "No single calendar has that name. Use list_calendars to see "
-        "the names."
-    )
-    raise CalendarError(message)
+class _TooMuchData(OSError):
+    """iCloud's answer to one request went over MAX_ICLOUD_BYTES.
 
-
-def _find_event(calendar: caldav.Calendar, uid: str) -> caldav.Event:
-    try:
-        return calendar.get_event_by_uid(uid)
-    except caldav.error.NotFoundError:
-        message = (
-            "No event with that UID in that calendar. Use list_events to "
-            "find it."
-        )
-        raise CalendarError(message) from None
-
-
-def _master(ical: icalendar.Calendar) -> icalendar.Event:
-    """Return the event itself, not a per-occurrence override of it."""
-    for component in ical.events:
-        if 'RECURRENCE-ID' not in component:
-            return component
-    raise CalendarError("Event has no editable master component.")
+    An OSError like the other ways a request can break off, so a write
+    it happens to is reported as unconfirmed.
+    """
 
 
 # --- Limits -----------------------------------------------------------------
@@ -462,49 +627,100 @@ def _check_lengths(**values: str | None) -> None:
             raise CalendarError(message)
 
 
-@contextlib.contextmanager
-def _writing():
-    """Report a write that failed in a way that leaves its outcome open."""
-    try:
-        yield
-    except OSError:
-        raise CalendarError(UNCONFIRMED) from None
-
-
 # --- Recurrence -------------------------------------------------------------
 
 def _occurrences(
     ical: icalendar.Calendar,
     range_start: datetime,
-    range_end: datetime
+    range_end: datetime,
+    deadline: float
 ) -> tuple[list[icalendar.Event], bool]:
     """Return a stored event's occurrences in the range, and whether
     that is all of them.
 
-    A series that would cost too much to expand, or that the library can't
+    A series that costs too much to expand, or that the library can't
     expand, comes back unexpanded and flagged incomplete.
     """
     events = ical.events
     try:
-        dense = any(
-            _too_dense(rule, component, range_start, range_end)
-            for component in events
-            for rule in _rules(component)
-        )
-        if not dense:
+        if not _too_costly(events, range_start, range_end):
             searcher = icalendar_searcher.Searcher(
                 event=True,
                 start=range_start,
                 end=range_end,
                 expand=True
             )
-            return list(searcher.check_component(ical) or []), True
-    except Exception:
-        # Malformed data from another client. Fall through and list the
-        # event unexpanded, so one bad event can't hide the others.
+            found = _bounded(
+                lambda: list(searcher.check_component(ical) or []),
+                deadline
+            )
+            return found, True
+    except (Exception, _OverBudget):
+        # Malformed data from another client, or a rule that cost too
+        # much. Fall through and list the event unexpanded, so one bad
+        # event can't hide the others.
         pass
     masters = [event for event in events if 'RECURRENCE-ID' not in event]
     return masters or events, False
+
+
+def _bounded(work, deadline: float):
+    """Run work(), stopping it once it has cost too much.
+
+    The libraries that expand a rule are plain Python loops with no way
+    to interrupt them from outside. So Python is asked to report every
+    function call they make, which is where the clocks get looked at:
+    after EXPANSION_SECONDS of this thread's processor time, or past the
+    deadline, _OverBudget is raised from inside them.
+    """
+    calls = 0
+    enough = clock.thread_time() + EXPANSION_SECONDS
+
+    def check(frame, event, argument):
+        # Returns nothing, which tells Python not to trace the call line
+        # by line as well.
+        nonlocal calls
+        calls += 1
+        if calls % 1000:
+            return
+        if clock.thread_time() > enough or clock.monotonic() > deadline:
+            raise _OverBudget()
+
+    # Per thread, so other tool calls are not timed or slowed.
+    previous = sys.gettrace()
+    sys.settrace(check)
+    try:
+        return work()
+    finally:
+        sys.settrace(previous)
+
+
+class _OverBudget(BaseException):
+    """Stops the work _bounded is running.
+
+    Not an Exception, so that no handler inside a library takes it for
+    one of its own failures and carries on.
+    """
+
+
+def _too_costly(
+    events: list[icalendar.Event],
+    range_start: datetime,
+    range_end: datetime
+) -> bool:
+    """Estimate whether expanding a stored event would blow the budget.
+
+    This only spares the work of starting on a rule that is plainly too
+    dense. The limit that holds for every rule is the one in _bounded.
+    """
+    steps = 0
+    found = 0
+    for component in events:
+        for rule in _rules(component):
+            cost = _rule_cost(rule, component, range_start, range_end)
+            steps += cost[0]
+            found += cost[1]
+    return steps > MAX_RULE_STEPS or found > MAX_EVENTS
 
 
 def _rules(component: icalendar.Event) -> list[icalendar.vRecur]:
@@ -512,19 +728,20 @@ def _rules(component: icalendar.Event) -> list[icalendar.vRecur]:
     return rules if isinstance(rules, list) else [rules]
 
 
-def _too_dense(
+def _rule_cost(
     rule: icalendar.vRecur,
     component: icalendar.Event,
     range_start: datetime,
     range_end: datetime
-) -> bool:
-    """Estimate whether expanding a stored rule would blow the budget."""
+) -> tuple[float, float]:
+    """Estimate the steps a rule takes to walk, and the occurrences it
+    puts in the range."""
     frequency = str(_single(rule, 'FREQ', '')).upper()
     interval = _single(rule, 'INTERVAL', 1)
     if frequency not in FREQUENCY_SECONDS or not isinstance(interval, int):
-        return True
+        return math.inf, math.inf
     if interval < 1:
-        return True
+        return math.inf, math.inf
     step = FREQUENCY_SECONDS[frequency] * interval
     # Each of these multiplies the occurrences every step produces.
     per_step = math.prod(
@@ -533,17 +750,20 @@ def _too_dense(
     )
     first = _sort_key(component.start)
     walked = (range_end - first).total_seconds() / step * per_step
+    # An occurrence that began before the range still counts while it
+    # lasts into it, so a long event widens the range it is found in.
+    lasting = _sort_key(component.end) - first
+    window = (range_end - range_start + lasting).total_seconds()
     # A rule coarser than daily can still land on every day (BYDAY).
-    window = (range_end - range_start).total_seconds()
     in_range = window / min(step, 86_400) * per_step
-    return walked > MAX_RULE_STEPS or in_range > MAX_EVENTS
+    return walked, in_range
 
 
 def _parse_rrule(rrule: str) -> icalendar.vRecur:
     """Parse and check a rule for a new event.
 
-    icalendar parses leniently (it accepts INTERVAL=0 and COUNT=-1), so
-    the values are checked here.
+    icalendar parses leniently (it accepts INTERVAL=0, COUNT=-1 and
+    BYDAY=99MO), so the values are checked here.
     """
     invalid = CalendarError(
         "Invalid rrule. Expected an RFC 5545 rule such as "
@@ -555,7 +775,8 @@ def _parse_rrule(rrule: str) -> icalendar.vRecur:
     except ValueError:
         raise invalid from None
 
-    if str(_single(rule, 'FREQ', '')).upper() not in RRULE_FREQUENCIES:
+    frequency = str(_single(rule, 'FREQ', '')).upper()
+    if frequency not in RRULE_FREQUENCIES:
         raise invalid
     if 'COUNT' in rule and 'UNTIL' in rule:
         raise invalid
@@ -573,7 +794,19 @@ def _parse_rrule(rrule: str) -> icalendar.vRecur:
     for part in ('FREQ', 'INTERVAL', 'COUNT', 'UNTIL', 'WKST'):
         if len(rule.get(part, [])) > 1:
             raise invalid
+    numbered = RRULE_WEEKDAY_NUMBERS.get(frequency, 0)
+    if not all(_is_weekday(day, numbered) for day in rule.get('BYDAY', [])):
+        raise invalid
+    if not all(_is_weekday(day, 0) for day in rule.get('WKST', [])):
+        raise invalid
     return rule
+
+
+def _is_weekday(value, highest: int) -> bool:
+    """Whether value is a weekday such as 'MO', or a numbered one such
+    as '-1FR' that counts no further than highest."""
+    match = WEEKDAY.fullmatch(str(value).upper())
+    return bool(match) and abs(int(match[1] or 0)) <= highest
 
 
 def _single(rule: icalendar.vRecur, part: str, default):
@@ -598,6 +831,14 @@ def _wrap(event: icalendar.Event) -> icalendar.Calendar:
     ical.pop('UID', None)
     ical.add_missing_timezones()
     return ical
+
+
+def _master(ical: icalendar.Calendar) -> icalendar.Event:
+    """Return the event itself, not a per-occurrence override of it."""
+    for component in ical.events:
+        if 'RECURRENCE-ID' not in component:
+            return component
+    raise CalendarError("Event has no editable master component.")
 
 
 def _reschedule(

@@ -101,8 +101,9 @@ def list_events(
     The range can be at most 366 days and hold at most 1000 events; past
     either limit the call fails rather than return part of the list, so
     cover a longer period with several calls. An entry marked
-    `occurrences_omitted` is a series that repeats too often to list each
-    occurrence: it appears once, with the start of its first occurrence.
+    `occurrences_omitted` is a series whose occurrences cost too much to
+    work out, usually because it repeats very often: it appears once, with
+    the start of its first occurrence.
     """
     return _run(
         'list_events',
@@ -188,7 +189,8 @@ def delete_event(calendar: str, uid: str) -> dict:
 
     For a recurring event this deletes the whole series, not a single
     occurrence. Fails without deleting if the event was changed by someone
-    else while the call was in progress.
+    else while the call was in progress, or if the call ran out of time
+    before the delete was sent.
     """
     return _run('delete_event', icloud.delete_event, calendar, uid)
 
