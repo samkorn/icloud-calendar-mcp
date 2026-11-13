@@ -128,9 +128,9 @@ nothing in the code reads it). Tests: `uv run pytest`.
   simultaneous tool calls can't multiply the requests in flight. iCloud
   needs one request per calendar. On an
   account with many calendars, a week's listing took about 5 seconds run in
-  sequence and 1 to 2 run concurrently. A year-wide `query` search is still
-  slow (about 8 seconds on that account), since it downloads every event in
-  the range.
+  sequence and 1 to 2 run concurrently. A year-wide `query` search takes
+  about 3 seconds on that account: it still downloads every event in the
+  range, but expands only the series whose text matches.
 - **Modal sizing:** `cpu=0.125`, `memory=256`, `max_containers=1`,
   `scaledown_window=60`, `timeout=90`. The single-container cap bounds what
   a flood of requests could cost. uv is pinned in the image build
@@ -201,11 +201,15 @@ reject every request that doesn't come from its owner's Claude account.
 - **Event text is someone else's input.** A collaborator on a shared
   calendar, or anyone who sends an invitation, can put text in an event.
   The server instructions tell the model to treat it as data.
+- **Verified against a real iCloud account (November 2026):** iCloud
+  gives looked-up events strong ETags, refuses a conditional delete of a
+  version that has since changed, and accepts one of the current version.
+  The listing matched what `caldav`'s own expansion returned, event for
+  event, over a two-week and a ninety-day range.
 - **Not verified on a real deployment:** that Modal passes the public
-  `Host` header through to the app, that Claude's connector sends no
-  `Origin`, and that iCloud's ETags work with the conditional delete. The
-  unit tests cover the logic, not those three facts. Check them after the
-  next deploy, with a throwaway event for the delete.
+  `Host` header through to the app, and that Claude's connector sends no
+  `Origin`. The unit tests cover the logic, not those two facts. Check
+  them after the next deploy.
 - **What isn't bounded:** the size of a response from iCloud. `caldav`
   buffers it whole and offers no cap.
 
