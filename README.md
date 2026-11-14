@@ -14,17 +14,34 @@ Anthropic or Modal.
 
 ## Tools
 
-| Tool             | What it does                                              |
-| ---------------- | --------------------------------------------------------- |
-| `list_calendars` | Names of your calendars                                   |
-| `list_events`    | Events in a time range, optionally filtered by text       |
-| `create_event`   | New timed, all-day or recurring event                     |
-| `update_event`   | Change the title, time, location or description           |
-| `delete_event`   | Delete an event                                           |
+| Tool              | What it does                                             |
+| ----------------- | -------------------------------------------------------- |
+| `list_calendars`  | Names of your calendars                                  |
+| `list_events`     | Events in a time range, optionally filtered by text      |
+| `list_busy_times` | When you are busy in a time range, with no event details |
+| `get_event`       | One event in full, with its invitees and repeat rule     |
+| `create_event`    | New timed, all-day or recurring event                    |
+| `update_event`    | Change an event, or one occurrence of a recurring one    |
+| `delete_event`    | Delete an event, one occurrence, or the rest of a series |
 
-Recurring events are listed one occurrence at a time, but `update_event` and
-`delete_event` act on the whole series. The tools can't invite anyone, add
-attendees or set alerts.
+An event can have a title, time, location, description, web link and
+alerts, and can be marked as free time. With a place's coordinates as well
+as its name, Apple's Calendar shows a map for it; that part has been
+checked only against what Apple's own apps store, not by looking at the
+result in Calendar.
+
+Recurring events are listed one occurrence at a time. To change or delete
+one, Claude has to say what it means: one occurrence, that occurrence and
+every later one (delete only), or the whole series. Without that the call
+is refused, so "delete Tuesday's standup" can't quietly delete all of them.
+
+Every event comes with the version that was read (its `etag`), and
+`update_event` and `delete_event` have to name it. If the event has changed
+since Claude read it, on your phone or by someone who shares the calendar,
+nothing happens and Claude is told to look again.
+
+The tools can't invite anyone or reply to an invitation: both make iCloud
+send mail to other people, and nothing on the server could hold that back.
 
 Events that already have invitees are a special case. iCloud may notify
 them when such an event is changed or deleted, so `list_events` marks it
@@ -256,7 +273,7 @@ In Claude, open Customize > Connectors > Add custom connector:
 Then ask Claude something like "What's on my calendar this week?" to see it
 work.
 
-Once it is added, the connector's page in the same settings lists the five
+Once it is added, the connector's page in the same settings lists the
 tools, and each can be set to always allowed, needing approval, or blocked.
 To let Claude see your calendars without being able to change them, block
 `create_event`, `update_event` and `delete_event`. "Needs approval" is the
@@ -370,6 +387,8 @@ Past the token check, the server:
 - accepts only requests addressed to its own host (`*.modal.run` when
   deployed; edit `ALLOWED_HOSTS` in `modal_app.py` if you use your own
   domain) and refuses requests that come from a web page;
+- sends your iCloud password only to iCloud's own calendar servers, over
+  HTTPS, and refuses a redirect that points anywhere else;
 - gives up on iCloud after 20 seconds of silence on a request and 45
   seconds per tool call, and sends no change once that time is up;
 - accepts at most 8 MiB from iCloud in answer to one request;
@@ -381,8 +400,10 @@ Past the token check, the server:
   quotes the argument back to whoever sent it);
 - fails a listing if iCloud left out an event's data and it couldn't be
   fetched, rather than return the list without that event;
-- changes or deletes an event only if it hasn't changed since it was
-  looked up.
+- changes or deletes an event only if it hasn't changed since Claude
+  read it;
+- changes a recurring event only as far as the call says: one occurrence,
+  the rest of the series, or all of it.
 
 Calendar names, and the titles and descriptions on shared calendars and
 invitations, are written by other people. Claude is told to treat them as

@@ -9,6 +9,7 @@ back. `safe_message` gives the same guarantee for errors from the libraries
 underneath.
 """
 
+import copy
 import functools
 import logging
 import math
@@ -20,6 +21,7 @@ import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import caldav
@@ -28,6 +30,9 @@ import icalendar_searcher
 import niquests
 
 ICLOUD_URL = 'https://caldav.icloud.com'
+# Where the iCloud password may be sent: the address above, and the
+# numbered servers it hands each account on to.
+ICLOUD_HOSTS = re.compile(r'(caldav|p[0-9]+-caldav)\.icloud\.com')
 PRODID = '-//icloud-calendar-mcp//EN'
 
 # Seconds iCloud may stay silent on one request before it is abandoned.
@@ -71,7 +76,20 @@ TEXT_LIMITS = {
     'start': 40,
     'end': 40,
     'timezone': 64,
+    'etag': 255,
+    'occurrence': 40,
+    'url': 2000,
 }
+# The most alerts one event may be given, and the earliest one may sound.
+MAX_ALERTS = 10
+MAX_ALERT_MINUTES = 28 * 24 * 60
+# What a change to a recurring event can apply to.
+SCOPES = ('series', 'occurrence', 'following')
+WEB_ADDRESS = re.compile(r'https?://[^\s<>"]+', re.IGNORECASE)
+# Where Apple's apps keep a place's coordinates, as a 'geo:' address. With
+# it the event shows a map.
+PLACE = 'X-APPLE-STRUCTURED-LOCATION'
+COORDINATES = re.compile(r'geo:(-?[0-9.]+),(-?[0-9.]+)', re.IGNORECASE)
 
 # Recurrence rules this server will create. Stored rules from other apps
 # may use the rest of RFC 5545; those are only bounded (see _occurrences).
@@ -127,7 +145,37 @@ UNCONFIRMED = (
 )
 CONFLICT = (
     "The event was changed by someone else in the meantime, so nothing "
-    "was done. Look at it again with list_events before retrying."
+    "was done. Look at it again with get_event before retrying."
+)
+STALE = (
+    "The event has changed since it was read, so nothing was done. Read "
+    "it again with get_event, tell the user what is different, and "
+    "retry with the new etag if the change still makes sense."
+)
+NOT_ICLOUD = (
+    "A request was headed somewhere other than iCloud, so it was not "
+    "sent."
+)
+NEEDS_SCOPE = (
+    "This event repeats, so say what the change applies to. Pass scope: "
+    "'occurrence' for one occurrence, 'following' for one occurrence "
+    "and every later one (delete_event only), or 'series' for all of "
+    "them. With 'occurrence' or 'following', also pass `occurrence`, "
+    "the value list_events gives for that occurrence. Ask the user if "
+    "it is not clear which they mean."
+)
+NOT_REPEATING = (
+    "This event does not repeat, so there is no occurrence to pick. "
+    "Leave out occurrence and scope."
+)
+NO_SUCH_OCCURRENCE = (
+    "This event has no occurrence starting then. Pass the `occurrence` "
+    "value list_events gives for the one you mean."
+)
+NOT_BY_OCCURRENCE = (
+    "This series can't be worked out one occurrence at a time: it "
+    "repeats too often, or its data is damaged. Only the whole series "
+    "can be changed."
 )
 
 
@@ -235,7 +283,7 @@ _pool = ThreadPoolExecutor(
 )
 
 
-# --- The five operations ----------------------------------------------------
+# --- The operations ---------------------------------------------------------
 
 def list_calendars() -> list[str]:
     """Return the names of the calendars that can hold events."""
@@ -275,77 +323,98 @@ def list_events(
         timezone=timezone
     )
     deadline = _deadline()
-    range_start = _parse_bound(start, timezone)
-    range_end = _parse_bound(end, timezone)
-    if range_end <= range_start:
-        raise CalendarError("end must be after start.")
-    if range_end - range_start > timedelta(days=MAX_RANGE_DAYS):
-        message = (
-            f"The range is longer than {MAX_RANGE_DAYS} days. Search a "
-            "longer period in several calls."
-        )
-        raise CalendarError(message)
-
-    if calendar:
-        calendars = [_find_calendar(calendar, deadline)]
-    else:
-        calendars = _calendars(deadline)
-
-    def search(cal: caldav.Calendar) -> list[caldav.Event]:
-        # Neither expanded nor filtered by caldav: both would expand every
-        # recurrence with no limit. _occurrences does it within a budget.
-        # The extra day each side covers all-day and floating events,
-        # which the server can't place in the caller's timezone.
-        return cal.search(
-            event=True,
-            start=range_start - timedelta(days=1),
-            end=range_end + timedelta(days=1),
-            expand=False,
-            post_filter=False
-        )
-
+    range_start, range_end = _range(start, end, timezone)
     found = []
-    count = 0
     size = 0
-    searched = _per_calendar(
-        search,
-        [cal for cal, _ in calendars],
-        deadline
-    )
-    for (_, name), results in zip(calendars, searched):
-        for result in results:
-            _check_deadline(deadline)
-            ical = result.icalendar_instance
-            if query and not _any_match(ical.events, query):
-                continue
-            components, complete = _occurrences(
-                ical,
-                range_start,
-                range_end,
-                deadline
-            )
-            count += len(components)
-            if count > MAX_EVENTS:
-                message = (
-                    f"More than {MAX_EVENTS} events in that range. Use a "
-                    "shorter range, name a calendar, or add a query."
-                )
-                raise CalendarError(message)
-            for component in components:
-                if query and not _matches(component, query):
-                    continue
-                entry = _event_to_dict(component, name, timezone)
-                if not complete:
-                    entry['occurrences_omitted'] = True
-                size += sum(len(str(value)) for value in entry.values())
-                if size > MAX_RESPONSE_CHARS:
-                    raise CalendarError(TOO_MUCH_TEXT)
-                found.append((_sort_key(component.start), entry))
+    matches = _search(range_start, range_end, calendar, query, deadline)
+    for component, name, etag, complete in matches:
+        entry = _event_to_dict(component, name, timezone, etag)
+        if not complete:
+            entry['occurrences_omitted'] = True
+        size += _size(entry)
+        if size > MAX_RESPONSE_CHARS:
+            raise CalendarError(TOO_MUCH_TEXT)
+        found.append((_sort_key(component.start), entry))
 
     # The last event's expansion may be what ran out the clock.
     _check_deadline(deadline)
     found.sort(key=lambda pair: pair[0])
     return [entry for _, entry in found]
+
+
+def list_busy_times(
+    start: str,
+    end: str,
+    calendar: str | None = None,
+    timezone: str | None = None
+) -> dict:
+    """Return when the calendars are busy within [start, end), merged.
+
+    Only times come back, no titles or other text. Events marked free
+    and cancelled events don't count. A series that costs too much to
+    expand is left out, and the result is then marked 'incomplete'.
+    """
+    _check_lengths(
+        start=start,
+        end=end,
+        calendar=calendar,
+        timezone=timezone
+    )
+    deadline = _deadline()
+    range_start, range_end = _range(start, end, timezone)
+    zone = _zone(timezone) or UTC
+    spans = []
+    incomplete = False
+    matches = _search(range_start, range_end, calendar, None, deadline)
+    for component, _, _, complete in matches:
+        if not complete:
+            incomplete = True
+        elif _is_busy(component):
+            begins = max(_moment(component.start, zone), range_start)
+            ends = min(_moment(component.end, zone), range_end)
+            if begins < ends:
+                spans.append((begins, ends))
+
+    _check_deadline(deadline)
+    result = {
+        'busy': [
+            {
+                'start': begins.astimezone(zone).isoformat(),
+                'end': ends.astimezone(zone).isoformat(),
+            }
+            for begins, ends in _merged(spans)
+        ],
+    }
+    if incomplete:
+        result['incomplete'] = True
+    return result
+
+
+def get_event(
+    calendar: str,
+    uid: str,
+    timezone: str | None = None
+) -> dict:
+    """Return one event in full, with the version to name when changing
+    it.
+
+    For a recurring event this is the event that repeats, with its rule,
+    not one of its occurrences.
+    """
+    _check_lengths(calendar=calendar, uid=uid, timezone=timezone)
+    deadline = _deadline()
+    _zone(timezone)
+    cal, name = _find_calendar(calendar, deadline)
+    event = _find_event(cal, uid, deadline)
+    component = _main(event.icalendar_instance)
+    entry = _event_to_dict(component, name, timezone, event.etag)
+    entry.update(_people(component))
+    rules = _rules(component)
+    if rules:
+        entry['rrule'] = rules[0].to_ical().decode()
+    if _size(entry) > MAX_RESPONSE_CHARS:
+        raise CalendarError("This event holds too much text to return.")
+    return entry
 
 
 def create_event(
@@ -356,7 +425,12 @@ def create_event(
     timezone: str | None = None,
     location: str | None = None,
     description: str | None = None,
-    rrule: str | None = None
+    rrule: str | None = None,
+    url: str | None = None,
+    alerts: list[int] | None = None,
+    free: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None
 ) -> dict:
     """Create an event and return it."""
     _check_lengths(
@@ -367,7 +441,8 @@ def create_event(
         timezone=timezone,
         location=location,
         description=description,
-        rrule=rrule
+        rrule=rrule,
+        url=url
     )
     deadline = _deadline()
     # Everything that can be wrong with the arguments is found here,
@@ -380,97 +455,165 @@ def create_event(
     else:
         dtend = dtstart + _default_duration(dtstart)
     _check_span(dtstart, dtend)
+    _check_details(location, url, alerts, latitude, longitude)
 
     event = icalendar.Event.new(
         uid=str(uuid.uuid4()),
         summary=summary,
         start=dtstart,
-        end=dtend,
-        location=location or None,
-        description=description or None
+        end=dtend
     )
     if rrule:
         event.add('rrule', _parse_rrule(rrule))
+    _edit(
+        event,
+        location=location,
+        description=description,
+        url=url,
+        alerts=alerts,
+        free=free,
+        latitude=latitude,
+        longitude=longitude
+    )
     data = _wrap(event).to_ical().decode()
 
     cal, name = _find_calendar(calendar, deadline)
     created = _event_to_dict(event, name, timezone)
-    _write(lambda: cal.add_event(ical=data), deadline)
-    return created
+    saved = _write(lambda: cal.add_event(ical=data), deadline)
+    return _with_version(created, saved)
 
 
 def update_event(
     calendar: str,
     uid: str,
+    etag: str,
     summary: str | None = None,
     start: str | None = None,
     end: str | None = None,
     timezone: str | None = None,
     location: str | None = None,
     description: str | None = None,
+    url: str | None = None,
+    alerts: list[int] | None = None,
+    free: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    occurrence: str | None = None,
+    scope: str | None = None,
     invitees_confirmed: bool = False
 ) -> dict:
     """Change the given fields of an event and return the result.
 
-    Fields left as None are untouched; an empty string clears location or
-    description. A recurring event is changed as a whole series. An event
-    with invitees is changed only when invitees_confirmed is true.
+    Fields left as None are untouched; an empty string clears location,
+    description or url, and an empty list clears the alerts. `etag` is
+    the version the caller read: if the event has changed since, nothing
+    is done. A recurring event needs `scope`: the whole series, or the
+    one occurrence named by `occurrence`. An event with invitees is
+    changed only when invitees_confirmed is true.
     """
     _check_lengths(
         calendar=calendar,
         uid=uid,
+        etag=etag,
         summary=summary,
         start=start,
         end=end,
         timezone=timezone,
         location=location,
-        description=description
+        description=description,
+        url=url,
+        occurrence=occurrence
     )
     deadline = _deadline()
     _zone(timezone)
+    _check_details(location, url, alerts, latitude, longitude)
+    _check_target(scope, occurrence)
+    if scope == 'following':
+        message = (
+            "Changing one occurrence and every later one is not "
+            "supported. Change the whole series, or one occurrence at a "
+            "time."
+        )
+        raise CalendarError(message)
     cal, name = _find_calendar(calendar, deadline)
     event = _find_event(cal, uid, deadline)
-    _version(event)
+    _version(event, etag)
     _check_invitees(event, invitees_confirmed)
     with event.edit_icalendar_instance() as ical:
-        component = _master(ical)
+        if _scope(ical, scope) == 'series':
+            component = _master(ical)
+        else:
+            found = _find_occurrence(ical, occurrence, deadline)
+            component = _own_details(ical, found)
         if start is not None or end is not None:
             _reschedule(component, start, end, timezone)
-        if summary is not None:
-            _set_text(component, 'SUMMARY', summary)
-        if location is not None:
-            _set_text(component, 'LOCATION', location)
-        if description is not None:
-            _set_text(component, 'DESCRIPTION', description)
+        _edit(
+            component,
+            summary=summary,
+            location=location,
+            description=description,
+            url=url,
+            alerts=alerts,
+            free=free,
+            latitude=latitude,
+            longitude=longitude
+        )
         ical.add_missing_timezones()
     updated = _event_to_dict(component, name, timezone)
     # 'etag' has caldav send the version it fetched as the condition (it
-    # was checked above that there is one), so iCloud refuses the save if
-    # the event changed in between.
+    # was checked above that there is one, and that it is the one the
+    # caller read), so iCloud refuses the save if the event changed in
+    # between.
     _write(lambda: event.save(precondition='etag'), deadline)
-    return updated
+    return _with_version(updated, event)
 
 
 def delete_event(
     calendar: str,
     uid: str,
+    etag: str,
+    occurrence: str | None = None,
+    scope: str | None = None,
     invitees_confirmed: bool = False
 ) -> dict:
-    """Delete an event (the whole series, if it recurs).
+    """Delete an event, or part of a recurring one.
 
-    An event with invitees is deleted only when invitees_confirmed is
-    true.
+    `etag` is the version the caller read: if the event has changed
+    since, nothing is deleted. A recurring event needs `scope`: the whole
+    series, the one occurrence named by `occurrence`, or that occurrence
+    and every later one. An event with invitees is deleted only when
+    invitees_confirmed is true.
     """
-    _check_lengths(calendar=calendar, uid=uid)
+    _check_lengths(
+        calendar=calendar,
+        uid=uid,
+        etag=etag,
+        occurrence=occurrence
+    )
     deadline = _deadline()
+    _check_target(scope, occurrence)
     cal, _ = _find_calendar(calendar, deadline)
     event = _find_event(cal, uid, deadline)
+    # Only the version the caller read, which is also the one just
+    # looked up: if another client changes the event after this, iCloud
+    # refuses and nothing is lost.
+    version = _version(event, etag)
     _check_invitees(event, invitees_confirmed)
-    # Only the version that was just looked up: if another client changed
-    # the event since, iCloud refuses and nothing is lost.
-    etag = _version(event)
-    _write(lambda: event.delete(if_match=etag), deadline)
-    return {'deleted': uid}
+    if _scope(event.icalendar_instance, scope) == 'series':
+        _write(lambda: event.delete(if_match=version), deadline)
+        return {'deleted': uid}
+
+    # The series stays, without some of its occurrences: a save, not a
+    # delete.
+    with event.edit_icalendar_instance() as ical:
+        found = _find_occurrence(ical, occurrence, deadline)
+        if scope == 'occurrence':
+            _drop_occurrence(ical, found)
+        else:
+            _end_before(ical, found)
+    deleted = {'deleted': uid, 'scope': scope, 'occurrence': occurrence}
+    _write(lambda: event.save(precondition='etag'), deadline)
+    return _with_version(deleted, event)
 
 
 def safe_message(error: Exception) -> str | None:
@@ -505,6 +648,87 @@ def safe_message(error: Exception) -> str | None:
 
 
 # --- iCloud lookups ---------------------------------------------------------
+
+def _search(
+    range_start: datetime,
+    range_end: datetime,
+    calendar: str | None,
+    query: str | None,
+    deadline: float
+):
+    """Yield what overlaps the range, in one calendar or in all of them.
+
+    Each event or occurrence comes with its calendar's name, the version
+    of the stored event it belongs to, and whether its series could be
+    expanded. Raises CalendarError past MAX_EVENTS.
+    """
+    if calendar:
+        calendars = [_find_calendar(calendar, deadline)]
+    else:
+        calendars = _calendars(deadline)
+
+    def search(cal: caldav.Calendar) -> list[caldav.Event]:
+        # Neither expanded nor filtered by caldav: both would expand every
+        # recurrence with no limit. _occurrences does it within a budget.
+        # The extra day each side covers all-day and floating events,
+        # which the server can't place in the caller's timezone.
+        return cal.search(
+            event=True,
+            start=range_start - timedelta(days=1),
+            end=range_end + timedelta(days=1),
+            expand=False,
+            post_filter=False
+        )
+
+    count = 0
+    searched = _per_calendar(
+        search,
+        [cal for cal, _ in calendars],
+        deadline
+    )
+    for (_, name), results in zip(calendars, searched):
+        for result in results:
+            _check_deadline(deadline)
+            ical = result.icalendar_instance
+            if query and not _any_match(ical.events, query):
+                continue
+            components, complete = _occurrences(
+                ical,
+                range_start,
+                range_end,
+                deadline
+            )
+            count += len(components)
+            if count > MAX_EVENTS:
+                message = (
+                    f"More than {MAX_EVENTS} events in that range. Use a "
+                    "shorter range, name a calendar, or add a query."
+                )
+                raise CalendarError(message)
+            for component in components:
+                if query and not _matches(component, query):
+                    continue
+                yield component, name, result.etag, complete
+
+
+def _range(
+    start: str,
+    end: str,
+    timezone: str | None
+) -> tuple[datetime, datetime]:
+    """Parse and check the two ends of a range to search."""
+    range_start = _parse_bound(start, timezone)
+    range_end = _parse_bound(end, timezone)
+    if range_end <= range_start:
+        raise CalendarError("end must be after start.")
+    if range_end - range_start > timedelta(days=MAX_RANGE_DAYS):
+        message = (
+            f"The range is longer than {MAX_RANGE_DAYS} days. Search a "
+            "longer period in several calls."
+        )
+        raise CalendarError(message)
+    return range_start, range_end
+
 
 def _calendars(deadline: float) -> list[tuple[caldav.Calendar, str]]:
     """Return every calendar on the account, each with its name."""
@@ -554,18 +778,50 @@ def _find_event(
         raise CalendarError(message) from None
 
 
-def _version(event: caldav.Event) -> str:
-    """Return the ETag naming exactly the version that was looked up.
+def _version(event: caldav.Event, read: str) -> str:
+    """Return the ETag naming exactly the version that was looked up,
+    which must be the one the caller read.
 
     A change or delete is sent on condition that the event still has it.
     Left to itself caldav settles for less when there is no strong ETag:
     a Schedule-Tag, which stays the same through some changes (RFC 6638),
     or for a save no condition at all. Here that is refused instead.
+
+    The caller's version closes the other gap: an event that changed
+    between the caller reading it and asking for the change would
+    otherwise be changed or deleted on the strength of what it used to
+    say.
     """
     etag = event.etag
-    if not etag or etag.startswith('W/'):
+    current = _shown(etag)
+    if current is None:
         raise CalendarError(NO_VERSION)
+    if read.strip().strip('"') != current:
+        raise CalendarError(STALE)
     return etag
+
+
+def _shown(etag: str | None) -> str | None:
+    """Return a strong ETag as callers see it, without its quotes.
+
+    None for a missing or weak one: a version that can't be made a
+    condition is not offered as one.
+    """
+    if not etag or etag.startswith('W/'):
+        return None
+    return etag.strip('"')
+
+
+def _with_version(reply: dict, stored) -> dict:
+    """Add to a reply the version iCloud gave what was just saved.
+
+    iCloud doesn't always give one. This runs after the write, so it
+    must not be able to fail: an error here would invite a retry.
+    """
+    etag = _shown(getattr(stored, 'etag', None))
+    if etag:
+        reply['etag'] = etag
+    return reply
 
 
 def _check_invitees(event: caldav.Event, confirmed: bool) -> None:
@@ -613,16 +869,17 @@ def _per_calendar(
             future.cancel()
 
 
-def _write(change, deadline: float) -> None:
+def _write(change, deadline: float):
     """Make one change at iCloud, or say so if its outcome is unknown.
 
     A change that has not been sent by the deadline never is: this stops
-    waiting for it then, and takes it back out of the queue.
+    waiting for it then, and takes it back out of the queue. Returns
+    whatever the change returns.
     """
     _check_deadline(deadline)
     future = _pool.submit(_in_time, change, deadline)
     try:
-        future.result(timeout=max(0, deadline - clock.monotonic()))
+        return future.result(timeout=max(0, deadline - clock.monotonic()))
     except OSError:
         # Out of time (TimeoutError is an OSError too), a lost connection,
         # or an answer cut short. If the change was still queued, taking
@@ -673,12 +930,22 @@ def _limit_answers(client: caldav.DAVClient) -> None:
 
 
 class _LimitedSession(niquests.Session):
-    """Reads iCloud's answers a piece at a time, up to a size and a time.
+    """Sends requests to iCloud only, and reads its answers a piece at a
+    time, up to a size and a time.
 
     caldav buffers a whole answer however large it is, and REQUEST_TIMEOUT
     only limits the silence between two pieces, not how long an answer
     that keeps trickling in may take.
     """
+
+    def send(self, request, **arguments):
+        # Every request leaves through here, each step of a redirect
+        # included, and caldav puts the password on all of them. The
+        # addresses come from iCloud's own answers, so one outside
+        # iCloud should never turn up; if one does, it gets nothing.
+        if not _is_icloud(request.url):
+            raise CalendarError(NOT_ICLOUD)
+        return super().send(request, **arguments)
 
     def request(self, method, url, **arguments):
         started = clock.monotonic()
@@ -701,6 +968,13 @@ class _LimitedSession(niquests.Session):
         # this attribute once the stream has been used up.
         response._content = bytes(body)
         return response
+
+
+def _is_icloud(url: str) -> bool:
+    """Whether a request to this address may carry the password."""
+    parts = urlsplit(url)
+    host = parts.hostname or ''
+    return parts.scheme == 'https' and bool(ICLOUD_HOSTS.fullmatch(host))
 
 
 class _TooMuchData(OSError):
@@ -933,6 +1207,189 @@ def _as_int(value) -> int | None:
         return None
 
 
+# --- One occurrence of a series ---------------------------------------------
+
+def _check_target(scope: str | None, occurrence: str | None) -> None:
+    """Check that scope and occurrence make sense together.
+
+    On the arguments alone, before iCloud is asked anything.
+    """
+    if scope is not None and scope not in SCOPES:
+        message = "scope must be 'series', 'occurrence' or 'following'."
+        raise CalendarError(message)
+    picks_one = scope in ('occurrence', 'following')
+    if picks_one != bool(occurrence):
+        raise CalendarError(NEEDS_SCOPE)
+    if occurrence:
+        _parse_occurrence(occurrence)
+
+
+def _scope(ical: icalendar.Calendar, scope: str | None) -> str:
+    """Return what a change to this event applies to.
+
+    An event that repeats is never changed on a guess. Asked to delete
+    "Tuesday's meeting", a caller that names only the event would
+    otherwise delete every one of them.
+    """
+    repeats = any(
+        name in component
+        for component in ical.events
+        for name in ('RRULE', 'RDATE', 'RECURRENCE-ID')
+    )
+    if not repeats:
+        if scope not in (None, 'series'):
+            raise CalendarError(NOT_REPEATING)
+        return 'series'
+    if scope is None:
+        raise CalendarError(NEEDS_SCOPE)
+    return scope
+
+
+def _find_occurrence(
+    ical: icalendar.Calendar,
+    occurrence: str,
+    deadline: float
+) -> icalendar.Event:
+    """Return the occurrence of a series that was due to start then.
+
+    Either the stored component that gives the occurrence details of its
+    own, or a copy made by expanding the series. An occurrence is named
+    by where its rule put it, wherever it has been moved to since.
+    """
+    wanted = _parse_occurrence(occurrence)
+    for component in ical.events:
+        if _same_moment(_original(component), wanted):
+            return component
+    around = _sort_key(wanted)
+    found, complete = _occurrences(
+        ical,
+        around - timedelta(days=1),
+        around + timedelta(days=1),
+        deadline
+    )
+    if not complete:
+        raise CalendarError(NOT_BY_OCCURRENCE)
+    for component in found:
+        if _same_moment(_original(component), wanted):
+            return component
+    raise CalendarError(NO_SUCH_OCCURRENCE)
+
+
+def _own_details(
+    ical: icalendar.Calendar,
+    found: icalendar.Event
+) -> icalendar.Event:
+    """Return the stored component holding one occurrence's own details.
+
+    A series without one for that occurrence is given it: a copy of the
+    event that repeats, at the occurrence's time and without the rule.
+    """
+    if any(found is component for component in ical.events):
+        return found
+    details = copy.deepcopy(_master(ical))
+    for name in ('RRULE', 'RDATE', 'EXDATE', 'EXRULE'):
+        details.pop(name, None)
+    for name in ('DTSTART', 'DTEND', 'DURATION'):
+        details.pop(name, None)
+    details.add('recurrence-id', _original(found))
+    details.add('dtstart', found.start)
+    details.add('dtend', found.end)
+    ical.add_component(details)
+    return details
+
+
+def _drop_occurrence(
+    ical: icalendar.Calendar,
+    found: icalendar.Event
+) -> None:
+    """Take one occurrence out of a series."""
+    master = _master(ical)
+    _remove(ical, [found])
+    master.add('exdate', _original(found))
+
+
+def _end_before(
+    ical: icalendar.Calendar,
+    found: icalendar.Event
+) -> None:
+    """End a series just before one of its occurrences."""
+    master = _master(ical)
+    first_gone = _original(found)
+    if master.rdates:
+        message = (
+            "This series lists some of its dates one by one, so it can't "
+            "be cut short here. Delete its occurrences one at a time, or "
+            "the whole series."
+        )
+        raise CalendarError(message)
+    if _sort_key(first_gone) <= _sort_key(master.start):
+        message = (
+            "That is the first occurrence. To delete it and every later "
+            "one, delete the whole series: scope 'series'."
+        )
+        raise CalendarError(message)
+    if not isinstance(first_gone, datetime):
+        last = first_gone - timedelta(days=1)
+    elif first_gone.tzinfo is None:
+        last = first_gone - timedelta(seconds=1)
+    else:
+        # RFC 5545 wants UNTIL in UTC when the start has a timezone.
+        last = (first_gone - timedelta(seconds=1)).astimezone(UTC)
+    for rule in _rules(master):
+        # A rule ends by count or by date, not both.
+        rule.pop('COUNT', None)
+        rule['UNTIL'] = [last]
+    later = [
+        component
+        for component in ical.events
+        if _original(component) is not None
+        and _sort_key(_original(component)) >= _sort_key(first_gone)
+    ]
+    _remove(ical, later)
+
+
+def _original(component: icalendar.Event) -> date | datetime | None:
+    """Return when the rule put an occurrence, or None for the event
+    that repeats."""
+    return getattr(component.get('RECURRENCE-ID'), 'dt', None)
+
+
+def _same_moment(
+    one: date | datetime | None,
+    other: date | datetime
+) -> bool:
+    """Whether two starts are the same.
+
+    Each is a date, a date-time with a zone or one without. Two of
+    different kinds are never the same.
+    """
+    def kind(value):
+        timed = isinstance(value, datetime)
+        return timed, timed and value.tzinfo is not None
+
+    return one is not None and kind(one) == kind(other) and one == other
+
+
+def _parse_occurrence(value: str) -> date | datetime:
+    """Parse an `occurrence` value as list_events writes it."""
+    try:
+        if len(value) == 10:
+            return date.fromisoformat(value)
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise CalendarError(NO_SUCH_OCCURRENCE) from None
+
+
+def _remove(ical: icalendar.Calendar, gone: list[icalendar.Event]) -> None:
+    """Take stored components out of an event: those very ones, not
+    others that happen to equal them."""
+    ical.subcomponents[:] = [
+        component
+        for component in ical.subcomponents
+        if not any(component is one for one in gone)
+    ]
+
+
 # --- Editing ----------------------------------------------------------------
 
 def _wrap(event: icalendar.Event) -> icalendar.Calendar:
@@ -977,10 +1434,116 @@ def _reschedule(
     component.add('dtend', dtend)
 
 
+def _check_details(
+    location: str | None,
+    url: str | None,
+    alerts: list[int] | None,
+    latitude: float | None,
+    longitude: float | None
+) -> None:
+    """Check the details an event can be given, before anything is done."""
+    if url and not WEB_ADDRESS.fullmatch(url):
+        message = "url must be a web address: http:// or https://."
+        raise CalendarError(message)
+    if alerts is not None:
+        usable = len(alerts) <= MAX_ALERTS and all(
+            type(minutes) is int and 0 <= minutes <= MAX_ALERT_MINUTES
+            for minutes in alerts
+        )
+        if not usable:
+            message = (
+                f"alerts must be at most {MAX_ALERTS} whole numbers of "
+                f"minutes before the start, from 0 to {MAX_ALERT_MINUTES}."
+            )
+            raise CalendarError(message)
+    if latitude is None and longitude is None:
+        return
+    numbers = all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in (latitude, longitude)
+    )
+    # Written so that a NaN fails it too.
+    if not (numbers and -90 <= latitude <= 90 and -180 <= longitude <= 180):
+        message = (
+            "latitude and longitude go together: latitude from -90 to "
+            "90, longitude from -180 to 180."
+        )
+        raise CalendarError(message)
+    if not location:
+        message = (
+            "Coordinates describe a place: pass its name or address as "
+            "location in the same call."
+        )
+        raise CalendarError(message)
+
+
+def _edit(
+    component: icalendar.Event,
+    summary: str | None = None,
+    location: str | None = None,
+    description: str | None = None,
+    url: str | None = None,
+    alerts: list[int] | None = None,
+    free: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None
+) -> None:
+    """Set the given details of an event; None leaves one as it is."""
+    if summary is not None:
+        _set_text(component, 'SUMMARY', summary)
+    if location is not None:
+        _set_text(component, 'LOCATION', location)
+        # Coordinates there already belong to the place this replaces.
+        component.pop(PLACE, None)
+        if latitude is not None:
+            _set_coordinates(component, location, latitude, longitude)
+    if description is not None:
+        _set_text(component, 'DESCRIPTION', description)
+    if url is not None:
+        _set_text(component, 'URL', url)
+    if free is not None:
+        component.pop('TRANSP', None)
+        component.add('transp', 'TRANSPARENT' if free else 'OPAQUE')
+    if alerts is not None:
+        _set_alerts(component, alerts)
+
+
 def _set_text(component: icalendar.Event, name: str, value: str) -> None:
     component.pop(name, None)
     if value:
         component.add(name, value)
+
+
+def _set_coordinates(
+    component: icalendar.Event,
+    location: str,
+    latitude: float,
+    longitude: float
+) -> None:
+    """Record where a place is, the way Apple's apps do."""
+    # A parameter can't hold a line break or a double quote.
+    title = ' '.join(location.replace('"', "'").split())
+    component.add(
+        PLACE,
+        icalendar.vUri(f'geo:{latitude:.6f},{longitude:.6f}'),
+        parameters={'VALUE': 'URI', 'X-TITLE': title}
+    )
+
+
+def _set_alerts(component: icalendar.Event, alerts: list[int]) -> None:
+    """Replace an event's alerts with ones the given minutes before it."""
+    component.subcomponents[:] = [
+        part
+        for part in component.subcomponents
+        if part.name != 'VALARM'
+    ]
+    title = str(component.get('SUMMARY', '')) or "Event"
+    for minutes in alerts:
+        alarm = icalendar.Alarm()
+        alarm.add('action', 'DISPLAY')
+        alarm.add('trigger', timedelta(minutes=-minutes))
+        alarm.add('description', title)
+        component.add_component(alarm)
 
 
 def _check_span(start: date | datetime, end: date | datetime) -> None:
@@ -1057,8 +1620,13 @@ def _zone(timezone: str | None) -> ZoneInfo | None:
 def _event_to_dict(
     component: icalendar.Event,
     calendar: str,
-    timezone: str | None
+    timezone: str | None,
+    etag: str | None = None
 ) -> dict:
+    """Describe an event or occurrence, leaving out whatever it lacks.
+
+    `etag` is the version of the stored event it is part of.
+    """
     start, end = component.start, component.end
     all_day = not isinstance(start, datetime)
     zone = _zone(timezone)
@@ -1073,15 +1641,129 @@ def _event_to_dict(
         'end': end.isoformat(),
         'all_day': all_day,
     }
-    for key in ('location', 'description'):
+    for key in ('location', 'description', 'url'):
         value = str(component.get(key.upper(), ''))
         if value:
             entry[key] = value
+    place = COORDINATES.match(str(component.get(PLACE, '')))
+    if place:
+        try:
+            entry['latitude'] = float(place[1])
+            entry['longitude'] = float(place[2])
+        except ValueError:
+            pass
+    alerts = _alerts(component)
+    if alerts:
+        entry['alerts'] = alerts
+    if str(component.get('TRANSP', '')).upper() == 'TRANSPARENT':
+        entry['free'] = True
+    status = str(component.get('STATUS', '')).lower()
+    if status in ('tentative', 'cancelled'):
+        entry['status'] = status
     if 'RRULE' in component or 'RECURRENCE-ID' in component:
         entry['recurring'] = True
+    original = _original(component)
+    if isinstance(original, datetime) and original.tzinfo is not None:
+        original = original.astimezone(UTC)
+    if original is not None:
+        # Names this occurrence to update_event and delete_event.
+        entry['occurrence'] = original.isoformat()
     if 'ATTENDEE' in component:
         entry['has_invitees'] = True
+    if _shown(etag):
+        entry['etag'] = _shown(etag)
     return entry
+
+
+def _alerts(component: icalendar.Event) -> list[int]:
+    """Return how many minutes before its start an event's alerts sound.
+
+    Alerts set some other way (at a fixed time, or after the start) are
+    not described.
+    """
+    minutes = set()
+    for part in component.subcomponents:
+        before = getattr(part.get('TRIGGER'), 'dt', None)
+        if part.name != 'VALARM' or type(before) is not timedelta:
+            continue
+        if before <= timedelta(0):
+            minutes.add(int(-before.total_seconds() // 60))
+    return sorted(minutes)
+
+
+def _people(component: icalendar.Event) -> dict:
+    """Return who organizes an event and who is invited, if anyone."""
+    people = {}
+    if 'ORGANIZER' in component:
+        people['organizer'] = _person(component['ORGANIZER'])
+    if 'ATTENDEE' in component:
+        people['invitees'] = _invitees(component)
+    return people
+
+
+def _invitees(component: icalendar.Event) -> list[dict]:
+    invitees = component.get('ATTENDEE', [])
+    if not isinstance(invitees, list):
+        invitees = [invitees]
+    return [_person(invitee) for invitee in invitees]
+
+
+def _person(address) -> dict:
+    """Describe an organizer or invitee: address, name and reply."""
+    person = {'email': re.sub('^mailto:', '', str(address), flags=re.I)}
+    parameters = getattr(address, 'params', {})
+    if parameters.get('CN'):
+        person['name'] = str(parameters['CN'])
+    if parameters.get('PARTSTAT'):
+        person['status'] = str(parameters['PARTSTAT']).lower()
+    return person
+
+
+def _main(ical: icalendar.Calendar) -> icalendar.Event:
+    """Return the event that best stands for a stored event: the one
+    that repeats, or failing that the first occurrence held."""
+    events = ical.events
+    if not events:
+        raise CalendarError("iCloud holds no event data under that UID.")
+    for component in events:
+        if 'RECURRENCE-ID' not in component:
+            return component
+    return events[0]
+
+
+def _size(entry: dict) -> int:
+    """Return roughly how many characters of text an entry holds."""
+    return sum(len(str(value)) for value in entry.values())
+
+
+def _is_busy(component: icalendar.Event) -> bool:
+    """Whether an event takes up the time it covers."""
+    free = str(component.get('TRANSP', '')).upper() == 'TRANSPARENT'
+    cancelled = str(component.get('STATUS', '')).upper() == 'CANCELLED'
+    return not free and not cancelled
+
+
+def _moment(value: date | datetime, zone) -> datetime:
+    """Place a start or end in time: a date or a floating time is taken
+    to be in the given zone."""
+    if not isinstance(value, datetime):
+        return datetime.combine(value, time.min, zone)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=zone)
+    return value
+
+
+def _merged(
+    spans: list[tuple[datetime, datetime]]
+) -> list[tuple[datetime, datetime]]:
+    """Join spans of time that overlap or touch, earliest first."""
+    merged = []
+    for begins, ends in sorted(spans):
+        if merged and begins <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], ends))
+        else:
+            merged.append((begins, ends))
+    return merged
 
 
 def _any_match(components: list[icalendar.Event], query: str) -> bool:
@@ -1089,11 +1771,15 @@ def _any_match(components: list[icalendar.Event], query: str) -> bool:
 
 
 def _matches(component: icalendar.Event, query: str) -> bool:
-    text = ' '.join(
+    """Whether the text is in an event's title, place, notes or guest
+    list."""
+    texts = [
         str(component.get(name, ''))
         for name in ('SUMMARY', 'LOCATION', 'DESCRIPTION')
-    )
-    return query.casefold() in text.casefold()
+    ]
+    for invitee in _invitees(component):
+        texts += [invitee['email'], invitee.get('name', '')]
+    return query.casefold() in ' '.join(texts).casefold()
 
 
 def _sort_key(start: date | datetime) -> datetime:

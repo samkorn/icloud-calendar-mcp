@@ -56,7 +56,9 @@ Flat modules at the repo root, no package and no build system:
 - `modal_app.py`: Modal image and the `web` ASGI function.
 - `tests/`: pytest, no network beyond a loopback server one fixture
   starts. `test_safety.py` holds the regression tests for the limits,
-  timeouts and error handling. `conftest.py` stops FastMCP from reading
+  timeouts and error handling, and the helpers the other test files
+  borrow. `test_events.py` covers single occurrences, busy times, reading
+  one event and event details. `conftest.py` stops FastMCP from reading
   `.env` when the tests import it.
 
 - `.github/workflows/checks.yml`: runs the tests and audits the locked
@@ -82,19 +84,65 @@ nothing in the code reads it). Tests: `uv run pytest`.
   Cloudflare Workers) have not been evaluated.
 - **MCP framework: FastMCP** (`fastmcp`), served over Streamable HTTP (the
   current MCP transport; SSE is legacy).
-- **Tools:** `list_calendars`, `list_events`, `create_event`,
-  `update_event`, `delete_event`. Text search is the `query` argument of
-  `list_events`, filtered in Python, because iCloud's server-side text
-  search is unreliable.
+- **Tools:** `list_calendars`, `list_events`, `list_busy_times`,
+  `get_event`, `create_event`, `update_event`, `delete_event`. Text search
+  is the `query` argument of `list_events`, filtered in Python, because
+  iCloud's server-side text search is unreliable. It looks at the title,
+  location, description and the invitees' names and addresses.
+- **`list_busy_times` answers "when am I free" without event text.** It
+  returns merged spans of time and nothing else, so a question about
+  free time puts no titles or descriptions, which other people can write,
+  in front of the model. Events marked free (`TRANSP:TRANSPARENT`) and
+  cancelled ones don't count. A series too costly to expand is left out
+  and the result is marked `incomplete`.
+- **`get_event` reads one event by calendar and UID.** It adds what a
+  listing leaves out (organizer, invitees and their replies, the rule) and
+  is how the model gets a fresh `etag` after a refusal. For a series it
+  describes the event that repeats, not an occurrence.
 - **Events are addressed by calendar name + UID.** Never accept a URL from a
   tool argument: the client would send the iCloud credentials to it.
 - **Times** are ISO 8601 strings. Date-only means all-day. A date-time needs
   a UTC offset or the `timezone` argument (IANA name); there is no default
   timezone setting.
 - **Recurring events:** listed expanded per occurrence, created with an
-  `rrule` argument, updated and deleted as a whole series. Editing a single
-  occurrence is not implemented. Adding attendees or alarms is out of
-  scope.
+  `rrule` argument. Each listed occurrence carries `occurrence`, the
+  start its rule gave it (its RECURRENCE-ID), which names it however far
+  it has been moved since.
+- **A recurring event is never changed on a guess.** `update_event` and
+  `delete_event` refuse one until the call says what it applies to:
+  `scope` is `'series'`, `'occurrence'` or `'following'`, the last two
+  with `occurrence`. Before this, a call naming only the event changed
+  or deleted every occurrence, which is not what "delete Tuesday's
+  standup" means.
+- **How each scope is stored.** Changing one occurrence adds a component
+  with that RECURRENCE-ID, copied from the event that repeats, or edits
+  the one already there. Deleting one adds an EXDATE and removes such a
+  component. Deleting an occurrence and every later one ends each rule
+  with an UNTIL just before it (in UTC when the start has a timezone,
+  and in place of any COUNT) and removes the later components. Each is
+  one conditional save of the stored event. The occurrence has to exist:
+  it is looked for among the stored components, then in a two-day
+  expansion run under the same budget as a listing, so a series too
+  dense to expand can only be changed whole.
+- **Not done: changing an occurrence and every later one.** Apple's apps
+  do it by splitting the series in two, which takes two writes that
+  can't be made atomic: a failure between them leaves the later half
+  doubled or missing. The other way, `RANGE=THISANDFUTURE`, is one write,
+  but Apple's apps don't write it and how they show it is untested.
+  Also not done: deleting from a series that lists dates one by one
+  (`RDATE`) with `'following'`; that is refused.
+- **Details an event can have:** `url`, `alerts` (minutes before the
+  start, stored as DISPLAY alarms, replacing whatever alarms were
+  there), `free` (TRANSP) and `latitude`/`longitude`. The coordinates go
+  with `location` into `X-APPLE-STRUCTURED-LOCATION`, where Apple's apps
+  keep them, and a new `location` drops the old ones. Reading that
+  property back from events Apple's apps made works; that Calendar draws
+  the map for one this server wrote has not been looked at.
+- **No invitations.** Adding attendees, or answering an invitation,
+  makes iCloud send mail to other people. A model misled by event text
+  could then send calendar details to any address, and the server has
+  nothing to hold that back but a prompt. Left out for that reason, and
+  because it can't be tested on an account with no invitations.
 - **An event that already has invitees needs a second call.** iCloud does
   the scheduling, so saving or deleting such an event may send its
   invitees an update, a cancellation or a decline. That has not been
@@ -166,9 +214,17 @@ nothing in the code reads it). Tests: `uv run pytest`.
   overwritten or deleted. `_version` requires a strong ETag and refuses
   the write without one. Left alone, `caldav` falls back to a
   Schedule-Tag, which RFC 6638 lets a server keep through some changes,
-  and sends a save with no condition at all when there is neither. This
-  covers the moment between lookup and write, not the time since the user
-  last saw the event.
+  and sends a save with no condition at all when there is neither.
+- **The caller names the version it read.** Every event a tool returns
+  carries `etag`, and `update_event` and `delete_event` require it and
+  do nothing unless it is the version the lookup finds. The condition
+  above only covers the moment between lookup and write; this covers
+  the time since the model read the event, during which someone else,
+  or the user on another device, may have changed what it is about to
+  change. The reply to a write carries the new `etag` when iCloud gives
+  one, added after the write by code that can't fail. The ETag is shown
+  without its quotes and accepted either way, to spare the model the
+  escaping.
 - **Stateless HTTP with JSON responses** (`stateless_http=True`,
   `json_response=True`), so nothing depends on a container staying alive.
 - **`caldav` is used with `features='icloud'`**, which makes the library
@@ -243,7 +299,7 @@ reject every request that doesn't come from its owner's Claude account.
   keep those annotations right. A server-side read-only switch was
   considered and left out.
 - **The server has no boundary between calendars.** The token reaches
-  every calendar and all five tools, so nothing in the server stops a
+  every calendar and every tool, so nothing in the server stops a
   model that event text has misled from reading another calendar or
   changing an event. What stands in the way is on the client: the tools
   that write need approval by default, and can be blocked. Claude's
@@ -317,6 +373,14 @@ reject every request that doesn't come from its owner's Claude account.
   current version.
   The listing matched what `caldav`'s own expansion returned, event for
   event, over a two-week and a ninety-day range.
+- **Verified read-only against a real iCloud account (November 2026),
+  for the tools and arguments added then:** a search returns a strong
+  ETag for every event; `get_event` returns the same one; an occurrence
+  named by a listing is found again in its series; the listing matched
+  the earlier code's, event for event, apart from the new keys. Not
+  verified: any write that uses the new arguments (one occurrence, the
+  rest of a series, alerts, link, free time, coordinates), since those
+  need the owner's go-ahead.
 - **Verified on a real deployment (November 2026):** calls from Claude's
   connector pass the Host and Origin checks on Modal with
   `ALLOWED_HOSTS = ['*.modal.run']`, the over-limit error reaches the
@@ -324,6 +388,17 @@ reject every request that doesn't come from its owner's Claude account.
   time budget on the smallest container. Not checked there: that a wrong
   `Host` is refused, since that needs the token, and Modal routes by host
   before the app sees a request anyway.
+- **The iCloud password goes only to iCloud.** `caldav` puts it on
+  every request, and the addresses it asks come out of iCloud's answers.
+  `_LimitedSession.send` refuses any that isn't HTTPS to
+  `caldav.icloud.com` or one of the numbered `pNN-caldav.icloud.com`
+  servers (`_is_icloud`). Every request leaves through `send`, each step
+  of a redirect included, so a redirect out of iCloud is not followed.
+  No tool takes a URL, so this is a second line, for an answer from
+  iCloud that points somewhere it shouldn't. A read-only run against a
+  real account asked only those two kinds of host. If Apple ever serves
+  an account from a host named differently, every call fails with
+  "somewhere other than iCloud" until the pattern is widened.
 - **Answers from iCloud are read through `_LimitedSession`,** which
   replaces the HTTP session `caldav` creates. It reads each answer in
   16 KiB pieces and stops at 8 MiB after decompression, or once the
