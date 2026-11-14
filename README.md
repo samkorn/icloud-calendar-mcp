@@ -1,4 +1,4 @@
-# icloud-calendar-mcp
+# iCloud Calendar MCP on Modal
 
 A remote [MCP](https://modelcontextprotocol.io) server that gives Claude
 read/write access to your iCloud calendars over CalDAV. It runs on
