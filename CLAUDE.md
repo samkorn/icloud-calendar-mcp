@@ -377,10 +377,19 @@ reject every request that doesn't come from its owner's Claude account.
   for the tools and arguments added then:** a search returns a strong
   ETag for every event; `get_event` returns the same one; an occurrence
   named by a listing is found again in its series; the listing matched
-  the earlier code's, event for event, apart from the new keys. Not
-  verified: any write that uses the new arguments (one occurrence, the
-  rest of a series, alerts, link, free time, coordinates), since those
-  need the owner's go-ahead.
+  the earlier code's, event for event, apart from the new keys.
+- **Verified by writing to a real iCloud account (November 2026),** on
+  throwaway events that were deleted afterwards: a series created with a
+  link, an alert, the free mark and coordinates reads back with all of
+  them; changing one occurrence changes only that one, which keeps its
+  `occurrence` value and its copy of the alert; deleting one occurrence,
+  and an occurrence with every later one, leaves exactly the others; a
+  change to the series leaves a changed occurrence as it was; a call
+  without `scope`, with a version that is not the current one, or for
+  an occurrence the series lacks is refused and changes nothing. iCloud
+  answers a create and a save with the new ETag, so the reply to a
+  write carries it. Not verified: that Calendar draws the map for
+  coordinates this server wrote, and that the alerts sound on a device.
 - **Verified on a real deployment (November 2026):** calls from Claude's
   connector pass the Host and Origin checks on Modal with
   `ALLOWED_HOSTS = ['*.modal.run']`, the over-limit error reaches the
