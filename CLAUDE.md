@@ -179,7 +179,14 @@ nothing in the code reads it). Tests: `uv run pytest`.
   `icloud.py` removes it; there is a regression test).
 - **The `caldav` logger is set to ERROR.** At WARNING it prints event
   contents when it repairs malformed data, which would put calendar data in
-  the Modal logs.
+  the Modal logs. `caldav` sets the level itself, to WARNING, in a module
+  it loads only when first needed, so `icloud.py` loads that module
+  before setting its own. Without that the level was back at WARNING
+  from the first tool call on, and only `_safe_record` (see Security)
+  kept the text out; a test in a separate process checks the level
+  holds. The repair itself is `caldav`'s and can't be turned off: an
+  event it repaired on reading (a title ending in a space, say) is
+  saved in its repaired form if `update_event` then changes it.
 - **Every call to iCloud runs on one pool of 8 threads** shared by the
   whole process (`_ask`, `_per_calendar` and `_write` in `icloud.py`), so
   simultaneous tool calls can't multiply the requests in flight. Nothing
