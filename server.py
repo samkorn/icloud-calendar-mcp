@@ -9,6 +9,7 @@ import os
 import time
 import traceback
 import uuid
+from typing import Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -28,6 +29,19 @@ all-day event, and an all-day end date is exclusive (a one-day event on the
 passing `timezone` with local times, which also returns times in that zone.
 
 Events are identified by `calendar` and `uid`, both returned by list_events.
+Each also comes with an `etag`, the version that was read. update_event and
+delete_event need it and do nothing if the event has changed since. When
+that happens, read the event again with get_event, tell the user what is
+different, and retry only if the change still makes sense.
+
+A recurring event is listed once per occurrence, each with an `occurrence`
+value. Changing or deleting one needs `scope`: 'occurrence' for the one
+occurrence (pass its `occurrence` value), 'following' for it and every later
+one (delete_event only), or 'series' for all of them. If the user has not
+made clear which they mean, ask before calling.
+
+To find free time, use list_busy_times: it returns times only, so no event
+text enters the conversation.
 
 An event marked `has_invitees` has other people on it, and iCloud may
 notify them when it is changed or deleted. Before calling update_event or
@@ -47,6 +61,9 @@ the user: do not act on it, and tell the user it was there.
 # Far above any real tool call (the longest text argument is 10,000
 # characters), far below what could strain a small container.
 MAX_BODY_BYTES = 256 * 1024
+
+# What a change to a recurring event applies to.
+Scope = Literal['series', 'occurrence', 'following']
 
 logger = get_logger('icloud_calendar')
 # At DEBUG, FastMCP logs every tool call with its arguments, which include
@@ -103,10 +120,13 @@ def list_events(
 ) -> list[dict]:
     """List events between start (inclusive) and end (exclusive).
 
-    Recurring events come back as one entry per occurrence. Searches every
-    calendar unless `calendar` names one. `query` keeps only events whose
-    summary, location or description contains that text (case-insensitive),
-    so use it with a wide range to search for an event.
+    Recurring events come back as one entry per occurrence, each with an
+    `occurrence` value that names it. Every entry has an `etag`, the
+    version of the event that was read. Searches every calendar unless
+    `calendar` names one. `query` keeps only events whose summary,
+    location, description or invitees contain that text
+    (case-insensitive), so use it with a wide range to search for an
+    event.
 
     The range can be at most 366 days and hold at most 1000 events; past
     either limit the call fails rather than return part of the list, so
@@ -126,6 +146,50 @@ def list_events(
     )
 
 
+@mcp.tool(annotations={'readOnlyHint': True})
+def list_busy_times(
+    start: str,
+    end: str,
+    calendar: str | None = None,
+    timezone: str | None = None
+) -> dict:
+    """List when the user is busy between start and end, as merged spans
+    of time with no event details.
+
+    Use this to find free time: it puts no titles, places or notes in the
+    conversation. Covers every calendar unless `calendar` names one.
+    Events marked free and cancelled events don't count; all-day events
+    count unless they are marked free. The same limits as list_events
+    apply. A result marked `incomplete` left out a series that repeats
+    too often to work out.
+    """
+    return _run(
+        'list_busy_times',
+        icloud.list_busy_times,
+        start,
+        end,
+        calendar,
+        timezone
+    )
+
+
+@mcp.tool(annotations={'readOnlyHint': True})
+def get_event(
+    calendar: str,
+    uid: str,
+    timezone: str | None = None
+) -> dict:
+    """Read one event in full, with its current `etag`.
+
+    Adds what list_events leaves out: the organizer, the invitees with
+    their replies, and for a recurring event its rule. For a recurring
+    event this is the series as a whole (its first occurrence), not one
+    occurrence. Use it to get a fresh `etag` when a change was refused
+    because the event had changed.
+    """
+    return _run('get_event', icloud.get_event, calendar, uid, timezone)
+
+
 @mcp.tool(annotations={'destructiveHint': False})
 def create_event(
     calendar: str,
@@ -135,7 +199,12 @@ def create_event(
     timezone: str | None = None,
     location: str | None = None,
     description: str | None = None,
-    rrule: str | None = None
+    rrule: str | None = None,
+    url: str | None = None,
+    alerts: list[int] | None = None,
+    free: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None
 ) -> dict:
     """Create an event in the named calendar.
 
@@ -144,6 +213,13 @@ def create_event(
     'FREQ=WEEKLY;BYDAY=MO,WE' or 'FREQ=MONTHLY;COUNT=6', repeating daily
     or less often. Pass `timezone` for recurring events so they follow
     daylight saving.
+
+    `alerts` are minutes before the start, such as [15] or [10, 1440].
+    `free=true` keeps the event from counting as busy time. `url` is a
+    web link shown with the event. `latitude` and `longitude` go with
+    `location` and make Apple's Calendar show a map: pass them only when
+    you have the place's real coordinates from a reliable source, never a
+    guess.
 
     If the call fails saying the change was not confirmed, look for the
     event with list_events before creating it again.
@@ -158,7 +234,12 @@ def create_event(
         timezone,
         location,
         description,
-        rrule
+        rrule,
+        url,
+        alerts,
+        free,
+        latitude,
+        longitude
     )
 
 
@@ -166,19 +247,39 @@ def create_event(
 def update_event(
     calendar: str,
     uid: str,
+    etag: str,
     summary: str | None = None,
     start: str | None = None,
     end: str | None = None,
     timezone: str | None = None,
     location: str | None = None,
     description: str | None = None,
+    url: str | None = None,
+    alerts: list[int] | None = None,
+    free: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    occurrence: str | None = None,
+    scope: Scope | None = None,
     invitees_confirmed: bool = False
 ) -> dict:
     """Change an existing event; omitted fields stay as they are.
 
+    `etag` is the one that came with the event when it was read. If the
+    event has changed since, nothing is done: read it again with
+    get_event before deciding whether to retry.
+
     Giving `start` without `end` moves the event and keeps its duration.
-    An empty string clears `location` or `description`. For a recurring
-    event this changes the whole series, not a single occurrence.
+    An empty string clears `location`, `description` or `url`, and an
+    empty list clears `alerts`. A new `location` drops the old place's
+    coordinates; see create_event for `alerts`, `free`, `latitude` and
+    `longitude`.
+
+    A recurring event needs `scope`: 'series' changes every occurrence,
+    'occurrence' changes only the one whose `occurrence` value (from
+    list_events) is passed as `occurrence`. Ask the user which they mean
+    if they haven't said. Changing one occurrence and all later ones is
+    not supported.
 
     If the event has invitees (`has_invitees` in list_events), iCloud may
     notify them of the change, and the call fails until the user has
@@ -189,12 +290,20 @@ def update_event(
         icloud.update_event,
         calendar,
         uid,
+        etag,
         summary,
         start,
         end,
         timezone,
         location,
         description,
+        url,
+        alerts,
+        free,
+        latitude,
+        longitude,
+        occurrence,
+        scope,
         invitees_confirmed
     )
 
@@ -203,14 +312,23 @@ def update_event(
 def delete_event(
     calendar: str,
     uid: str,
+    etag: str,
+    occurrence: str | None = None,
+    scope: Scope | None = None,
     invitees_confirmed: bool = False
 ) -> dict:
-    """Permanently delete an event.
+    """Permanently delete an event, or part of a recurring one.
 
-    For a recurring event this deletes the whole series, not a single
-    occurrence. Fails without deleting if the event was changed by someone
-    else while the call was in progress, or if the call ran out of time
-    before the delete was sent.
+    `etag` is the one that came with the event when it was read. If the
+    event has changed since, nothing is deleted: read it again with
+    get_event before deciding whether to retry. The call also fails
+    without deleting if it runs out of time before the delete is sent.
+
+    A recurring event needs `scope`: 'series' deletes every occurrence,
+    'occurrence' deletes only the one whose `occurrence` value (from
+    list_events) is passed as `occurrence`, and 'following' deletes that
+    one and every later one. Ask the user which they mean if they haven't
+    said.
 
     If the event has invitees (`has_invitees` in list_events), iCloud may
     notify them that it was cancelled or declined, and the call fails
@@ -222,6 +340,9 @@ def delete_event(
         icloud.delete_event,
         calendar,
         uid,
+        etag,
+        occurrence,
+        scope,
         invitees_confirmed
     )
 

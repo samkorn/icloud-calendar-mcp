@@ -13,6 +13,7 @@ import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import caldav
 import icalendar
@@ -59,6 +60,8 @@ data = sys.stdin.read()
 
 
 class Stored:
+    etag = '"version-1"'
+
     @property
     def icalendar_instance(self):
         return icalendar.Calendar.from_ical(data)
@@ -111,7 +114,7 @@ class FakeCalendar:
     def search(self, **arguments):
         self.searches.append(arguments)
         return [
-            SimpleNamespace(icalendar_instance=ical)
+            SimpleNamespace(icalendar_instance=ical, etag='"version-1"')
             for ical in self.stored
         ]
 
@@ -141,8 +144,19 @@ class Answers(http.server.BaseHTTPRequestHandler):
 
     SMALL = b'<multistatus xmlns="DAV:"/>'
     LARGE = b'<a>' + b'x' * 200_000 + b'</a>'
+    # The paths asked for, across every request to the server.
+    seen = []
 
     def do_GET(self):
+        self.seen.append(self.path)
+        if self.path == '/redirect':
+            # To the same server under another name: another host.
+            port = self.server.server_address[1]
+            self.send_response(302)
+            self.send_header('Location', f'http://localhost:{port}/small')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         body = self.SMALL if self.path == '/small' else self.LARGE
         self.send_response(207)
         self.send_header('Content-Type', 'text/xml')
@@ -170,8 +184,18 @@ class Answers(http.server.BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def answers():
-    """Send a request through the limited session to a loopback server."""
+def answers(monkeypatch):
+    """Send a request through the limited session to a loopback server.
+
+    The server stands in for iCloud: its address, and only that one, is
+    treated as iCloud's.
+    """
+    monkeypatch.setattr(
+        icloud,
+        '_is_icloud',
+        lambda url: urlsplit(url).hostname == '127.0.0.1'
+    )
+    Answers.seen.clear()
     # Not http.server's own server class: that one looks its host name up
     # in DNS when it starts.
     httpd = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Answers)
@@ -227,7 +251,13 @@ def test_unknown_calendar_does_not_list_the_others(
         get_calendars=lambda: [FakeCalendar(name=SECRET)]
     )
     monkeypatch.setattr(icloud, '_principal', lambda: principal)
-    reply = call_tool(client, 'delete_event', calendar='nope', uid='x')
+    reply = call_tool(
+        client,
+        'delete_event',
+        calendar='nope',
+        uid='x',
+        etag='version-1'
+    )
     assert 'list_calendars' in reply
     assert SECRET not in reply
     assert SECRET not in '\n'.join(logs)
@@ -986,8 +1016,10 @@ def test_expansion_stops_at_the_deadline(monkeypatch):
         lambda: icloud.list_calendars(),
         lambda: icloud.list_events('2026-11-13', '2026-11-14'),
         lambda: icloud.create_event('Home', "Lunch", '2026-11-13'),
-        lambda: icloud.update_event('Home', 'abc', summary="Renamed"),
-        lambda: icloud.delete_event('Home', 'abc'),
+        lambda: icloud.list_busy_times('2026-11-13', '2026-11-14'),
+        lambda: icloud.get_event('Home', 'abc'),
+        lambda: icloud.update_event('Home', 'abc', 'v1', summary="Renamed"),
+        lambda: icloud.delete_event('Home', 'abc', 'v1'),
     ]
 )
 def test_every_tool_gives_up_at_the_deadline(monkeypatch, call):
@@ -1072,11 +1104,48 @@ def test_answer_that_trickles_in_is_cut_off(monkeypatch, answers):
     assert time.monotonic() - began < 3
 
 
+# --- The password goes to iCloud and nowhere else ---------------------------
+
+@pytest.mark.parametrize(
+    ('url', 'allowed'),
+    [
+        ('https://caldav.icloud.com/', True),
+        ('https://p42-caldav.icloud.com/123/calendars/', True),
+        ('https://P42-CALDAV.icloud.com:443/123/', True),
+        ('http://caldav.icloud.com/', False),
+        ('https://caldav.icloud.com.untrusted.example/', False),
+        ('https://untrusted.example/caldav.icloud.com', False),
+        ('https://caldav.icloud.com@untrusted.example/', False),
+        ('https://www.icloud.com/', False),
+        ('https://127.0.0.1/', False),
+        ('not a url', False),
+    ]
+)
+def test_only_icloud_addresses_count_as_icloud(url, allowed):
+    assert icloud._is_icloud(url) is allowed
+
+
+def test_request_to_another_address_is_never_sent(monkeypatch, answers):
+    monkeypatch.setattr(icloud, '_is_icloud', lambda url: False)
+    with pytest.raises(icloud.CalendarError, match="other than iCloud"):
+        answers('/small')
+    assert Answers.seen == []
+
+
+def test_redirect_out_of_icloud_is_not_followed(answers):
+    with pytest.raises(icloud.CalendarError, match="other than iCloud"):
+        answers('/redirect')
+    # The redirect was received, and where it pointed was never asked.
+    assert Answers.seen == ['/redirect']
+    assert answers('/small').status == 207
+
+
 # --- Changes and deletes don't destroy someone else's change ----------------
 
 def test_delete_names_the_version_it_looked_up(monkeypatch):
     requests = stub_event(monkeypatch, etag='"version-1"', status=204)
-    assert icloud.delete_event('Home', 'abc') == {'deleted': 'abc'}
+    deleted = icloud.delete_event('Home', 'abc', 'version-1')
+    assert deleted == {'deleted': 'abc'}
     assert [request['method'] for request in requests] == ['DELETE']
     sent = {
         name.lower(): value
@@ -1088,7 +1157,7 @@ def test_delete_names_the_version_it_looked_up(monkeypatch):
 def test_delete_of_a_changed_event_is_a_conflict(monkeypatch):
     requests = stub_event(monkeypatch, etag='"version-1"', status=412)
     with pytest.raises(caldav.error.ETagMismatchError) as raised:
-        icloud.delete_event('Home', 'abc')
+        icloud.delete_event('Home', 'abc', 'version-1')
     assert "changed by someone else" in icloud.safe_message(raised.value)
     # Refused once, and not tried again against the newer version.
     assert len(requests) == 1
@@ -1101,7 +1170,7 @@ def test_delete_goes_by_the_etag_not_the_schedule_tag(monkeypatch):
         status=204,
         schedule_tag='"schedule-1"'
     )
-    icloud.delete_event('Home', 'abc')
+    icloud.delete_event('Home', 'abc', 'version-1')
     assert sent_conditions(requests) == [{'if-match': '"version-1"'}]
 
 
@@ -1120,7 +1189,7 @@ def test_delete_without_a_usable_version_does_nothing(
         schedule_tag=schedule_tag
     )
     with pytest.raises(icloud.CalendarError, match="no version"):
-        icloud.delete_event('Home', 'abc')
+        icloud.delete_event('Home', 'abc', 'version-1')
     assert requests == []
 
 
@@ -1131,7 +1200,12 @@ def test_update_names_the_version_it_looked_up(monkeypatch):
         status=204,
         schedule_tag='"schedule-1"'
     )
-    updated = icloud.update_event('Home', 'abc', summary="Renamed")
+    updated = icloud.update_event(
+        'Home',
+        'abc',
+        'version-1',
+        summary="Renamed"
+    )
     assert updated['summary'] == "Renamed"
     assert [request['method'] for request in requests] == ['PUT']
     assert sent_conditions(requests) == [{'if-match': '"version-1"'}]
@@ -1151,8 +1225,71 @@ def test_update_without_a_usable_version_does_nothing(
         schedule_tag=schedule_tag
     )
     with pytest.raises(icloud.CalendarError, match="no version"):
-        icloud.update_event('Home', 'abc', summary="Renamed")
+        icloud.update_event('Home', 'abc', 'version-1', summary="Renamed")
     assert requests == []
+
+
+# --- Nor a change the caller has not seen -----------------------------------
+
+CHANGES = [
+    lambda etag: icloud.update_event('Home', 'abc', etag, summary="Renamed"),
+    lambda etag: icloud.delete_event('Home', 'abc', etag),
+]
+
+
+def test_listing_gives_each_event_the_version_that_was_read(monkeypatch):
+    calendar = FakeCalendar(stored=[stored_event(summary="Dentist")])
+    use_calendar(monkeypatch, calendar)
+    events = icloud.list_events('2026-11-13', '2026-11-14', calendar='Home')
+    assert [event['etag'] for event in events] == ['version-1']
+
+
+@pytest.mark.parametrize('change', CHANGES)
+def test_event_changed_since_it_was_read_is_left_alone(monkeypatch, change):
+    requests = stub_event(monkeypatch, etag='"version-2"')
+    with pytest.raises(icloud.CalendarError, match="changed since"):
+        change('version-1')
+    assert requests == []
+
+
+@pytest.mark.parametrize('change', CHANGES)
+@pytest.mark.parametrize('read', ['version-1', '"version-1"'])
+def test_version_is_accepted_with_or_without_quotes(
+    monkeypatch,
+    change,
+    read
+):
+    requests = stub_event(monkeypatch, etag='"version-1"')
+    change(read)
+    assert sent_conditions(requests) == [{'if-match': '"version-1"'}]
+
+
+def test_weak_version_is_not_offered_as_one():
+    event = stored_event(summary="Dentist").events[0]
+    assert 'etag' not in icloud._event_to_dict(event, 'Home', None, 'W/"1"')
+    assert 'etag' not in icloud._event_to_dict(event, 'Home', None, None)
+
+
+def test_reply_to_a_change_carries_the_new_version(monkeypatch):
+    stub_event(monkeypatch, answered={'Etag': '"version-2"'})
+    updated = icloud.update_event(
+        'Home',
+        'abc',
+        'version-1',
+        summary="Renamed"
+    )
+    assert updated['etag'] == 'version-2'
+
+
+def test_reply_has_no_version_when_icloud_gave_none(monkeypatch):
+    stub_event(monkeypatch)
+    updated = icloud.update_event(
+        'Home',
+        'abc',
+        'version-1',
+        summary="Renamed"
+    )
+    assert 'etag' not in updated
 
 
 # --- An event with invitees is changed only after the user agreed -----------
@@ -1172,8 +1309,19 @@ def test_events_with_invitees_are_marked_in_listings(monkeypatch):
 @pytest.mark.parametrize(
     'change',
     [
-        lambda **more: icloud.update_event('Home', 'abc', "Renamed", **more),
-        lambda **more: icloud.delete_event('Home', 'abc', **more),
+        lambda **more: icloud.update_event(
+            'Home',
+            'abc',
+            'version-1',
+            "Renamed",
+            **more
+        ),
+        lambda **more: icloud.delete_event(
+            'Home',
+            'abc',
+            'version-1',
+            **more
+        ),
     ]
 )
 def test_event_with_invitees_needs_confirming(monkeypatch, change):
@@ -1198,7 +1346,13 @@ def test_confirmation_is_asked_for_through_the_tool(client, monkeypatch):
         status=204,
         invitee=True
     )
-    reply = call_tool(client, 'delete_event', calendar='Home', uid='abc')
+    reply = call_tool(
+        client,
+        'delete_event',
+        calendar='Home',
+        uid='abc',
+        etag='version-1'
+    )
     assert '"isError":true' in reply
     assert "invitees_confirmed" in reply
     assert requests == []
@@ -1207,6 +1361,7 @@ def test_confirmation_is_asked_for_through_the_tool(client, monkeypatch):
         'delete_event',
         calendar='Home',
         uid='abc',
+        etag='version-1',
         invitees_confirmed=True
     )
     assert '"isError":true' not in reply
@@ -1233,6 +1388,7 @@ def test_invalid_timezone_on_update_is_refused_first(no_icloud):
         icloud.update_event(
             'Home',
             'abc',
+            'version-1',
             summary="Renamed",
             timezone='Mars/Invalid'
         )
@@ -1262,6 +1418,72 @@ def test_unconfirmed_write_says_so(monkeypatch):
     use_calendar(monkeypatch, calendar)
     with pytest.raises(icloud.CalendarError, match="may or may not"):
         icloud.create_event('Home', "Lunch", '2026-11-13')
+
+
+# --- The client can tell the tools that read from the ones that write -------
+
+def test_tools_that_only_read_are_marked_so(client):
+    reply = client.post(
+        '/mcp',
+        headers=HEADERS,
+        json={'jsonrpc': '2.0', 'id': 3, 'method': 'tools/list'}
+    )
+    tools = {
+        tool['name']: tool.get('annotations', {})
+        for tool in reply.json()['result']['tools']
+    }
+    read_only = {
+        name
+        for name, annotations in tools.items()
+        if annotations.get('readOnlyHint')
+    }
+    assert read_only == {
+        'list_calendars',
+        'list_events',
+        'list_busy_times',
+        'get_event',
+    }
+    assert set(tools) - read_only == {
+        'create_event',
+        'update_event',
+        'delete_event',
+    }
+
+
+def test_new_tools_answer_through_the_server(client, monkeypatch):
+    stub_event(monkeypatch)
+    reply = call_tool(client, 'get_event', calendar='Home', uid='abc')
+    assert '"isError":true' not in reply
+    assert 'version-1' in reply
+    calendar = FakeCalendar(stored=[stored_event(summary=SECRET)])
+    use_calendar(monkeypatch, calendar)
+    reply = call_tool(
+        client,
+        'list_busy_times',
+        start='2026-11-13',
+        end='2026-11-14',
+        calendar='Home'
+    )
+    assert '2026-11-13T15:00:00+00:00' in reply
+    assert SECRET not in reply
+
+
+def test_series_is_not_deleted_through_the_tool_without_scope(
+    client,
+    monkeypatch
+):
+    stored = stored_event(summary="Standup", rrule='FREQ=WEEKLY')
+    requests = stub_event(monkeypatch, stored=stored)
+    reply = call_tool(
+        client,
+        'delete_event',
+        calendar='Home',
+        uid='abc',
+        etag='version-1'
+    )
+    assert '"isError":true' in reply
+    assert "scope" in reply
+    assert requests == []
 
 
 # --- Host and Origin --------------------------------------------------------
@@ -1392,22 +1614,28 @@ def record_expansions(expanded: list[str]):
 
 def stub_event(
     monkeypatch,
-    etag: str | None,
-    status: int,
+    etag: str | None = '"version-1"',
+    status: int = 204,
     schedule_tag: str | None = None,
-    invitee: bool = False
+    invitee: bool = False,
+    stored: icalendar.Calendar | None = None,
+    answered: dict | None = None
 ) -> list[dict]:
     """Make 'abc' in 'Home' a real caldav event on a fake connection.
 
     Returns the list that collects the requests caldav sends for it.
+    `stored` is the event's data, and `answered` the headers of every
+    reply.
     """
     requests = []
+    if stored is None:
+        stored = stored_event(summary="Dentist", invitee=invitee)
 
     def request(url, method='GET', body='', headers=None, **keywords):
-        requests.append({'method': method, 'headers': headers})
+        requests.append({'method': method, 'headers': headers, 'body': body})
         return SimpleNamespace(
             status=status,
-            headers={},
+            headers=answered or {},
             reason='synthetic',
             raw='',
             tree=None
@@ -1427,10 +1655,7 @@ def stub_event(
     event = caldav.Event(
         client=connection,
         url=f'{icloud.ICLOUD_URL}/synthetic/abc.ics',
-        data=stored_event(
-            summary="Dentist",
-            invitee=invitee
-        ).to_ical().decode(),
+        data=stored.to_ical().decode(),
         parent=parent
     )
     if etag is not None:
