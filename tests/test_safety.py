@@ -71,6 +71,31 @@ print(json.dumps(events))
 """
 
 
+# Reads one stored event, from stdin, the way a tool call does: through
+# caldav, which repairs flawed data as it takes it in. In a process of its
+# own, because what matters is the state caldav's logging is left in once
+# its parts have been loaded, which only happens once per process.
+REPAIR = """
+import logging
+import sys
+
+import caldav
+
+import icloud
+import server
+
+logging.basicConfig(level=logging.DEBUG)
+# What a tool call uses first. caldav loads each part when it is asked for.
+caldav.DAVClient, caldav.Calendar, caldav.Event
+event = caldav.Event(data=sys.stdin.read())
+summary = event.icalendar_instance.events[0]['SUMMARY']
+print(
+    logging.getLogger('caldav').level,
+    'untouched' if summary.endswith(' ') else 'repaired'
+)
+"""
+
+
 class FakeCalendar:
     """A calendar holding the given stored events, recording every call."""
 
@@ -299,6 +324,38 @@ def test_warnings_do_not_quote_what_was_parsed():
     assert 'GloballyUniqueTZIDGuessed raised at ' in listing.stderr
     [event] = json.loads(listing.stdout)
     assert event['start'] == '2026-11-13T09:00:00-05:00'
+
+
+def test_caldav_says_nothing_when_it_repairs_an_event():
+    # A title ending in a space is one of the flaws caldav repairs when
+    # it reads an event, and at WARNING it logs the lines it changed.
+    data = '\r\n'.join([
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'BEGIN:VEVENT',
+        'UID:repaired',
+        f'SUMMARY:{SECRET} ',
+        'DTSTAMP:20261113T090000Z',
+        'DTSTART:20261113T090000Z',
+        'DTEND:20261113T100000Z',
+        'END:VEVENT',
+        'END:VCALENDAR',
+        '',
+    ])
+    repair = subprocess.run(
+        [sys.executable, '-c', REPAIR],
+        input=data,
+        capture_output=True,
+        text=True,
+        cwd=Path(icloud.__file__).parent,
+        timeout=60
+    )
+    assert repair.returncode == 0
+    # The level this server set is still there once caldav is in use,
+    # and the event was repaired.
+    assert repair.stdout.split() == [str(logging.ERROR), 'repaired']
+    assert 'caldav' not in repair.stderr
+    assert SECRET not in repair.stderr
 
 
 def test_client_is_told_that_results_are_not_instructions(client):

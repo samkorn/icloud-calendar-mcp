@@ -23,6 +23,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import caldav
+import caldav.lib.error
 import icalendar
 import icalendar_searcher
 import niquests
@@ -147,6 +148,11 @@ logger = logging.getLogger(__name__)
 # caldav logs event contents when it repairs malformed data from the server.
 # Below ERROR it says nothing at all; what is left goes through
 # _safe_record.
+#
+# caldav sets this level too, to WARNING, in a module it doesn't load
+# until something needs it (caldav.lib.error). That is why this file
+# imports that module by name at the top: left to load later, on the
+# first use of a calendar, it would undo this line.
 logging.getLogger('caldav').setLevel(logging.ERROR)
 
 CALDAV_DIRECTORY = os.path.dirname(caldav.__file__)
